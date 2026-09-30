@@ -1,0 +1,40 @@
+{
+  "name": "ai-mission-manager-electron",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI Mission Manager desktop app",
+  "homepage": "https://github.com/pierophp/ai-mission-manager-electron#readme",
+  "bugs": {
+    "url": "https://github.com/pierophp/ai-mission-manager-electron/issues"
+  },
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pierophp/ai-mission-manager-electron.git"
+  },
+  "type": "commonjs",
+  "main": "src/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vp dev --host 127.0.0.1\" \"wait-on tcp:5173 && cross-env ELECTRON_RENDERER_URL=http://127.0.0.1:5173 electron .\"",
+    "start": "electron .",
+    "build": "vp build",
+    "package": "vp build && electron-forge package",
+    "make": "vp build && electron-forge make",
+    "check": "vp check src vite.config.ts forge.config.cjs package.json README.md tsconfig.json && tsc --noEmit"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^8.0.1",
+    "@electron-forge/maker-zip": "^8.0.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^10.0.5",
+    "cross-env": "^10.1.0",
+    "electron": "^44.5.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "typescript": "^7.0.2",
+    "vite-plus": "^1.0.0",
+    "wait-on": "^9.5.1"
+  }
+}
