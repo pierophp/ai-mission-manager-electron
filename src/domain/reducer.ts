@@ -227,6 +227,13 @@ export function decide(state: DomainState, event: Event): Decision {
     case "create_context":
       withDefaultProject(event.name);
       break;
+    case "complete_setup": {
+      const name = event.contextName.trim();
+      if (!name) throw new DomainError("A Context name is required to finish setup");
+      if (!next.contexts.some((entry) => entry.name === name)) withDefaultProject(name);
+      effects.push({ type: "persist_setup", provider: event.provider });
+      break;
+    }
     case "create_context_configuration": {
       const value = withDefaultProject(event.configuration.name);
       applyConfiguration(value.id, { ...event.configuration, name: value.name }, true);

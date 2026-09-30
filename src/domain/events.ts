@@ -11,11 +11,13 @@ import type {
   CliConfigurationProfile,
   AgentKind,
   WorkspaceRepositoryInput,
+  ProviderChoice,
 } from "./types";
 import type { DomainState } from "./model";
 
 export type Event =
   | { type: "create_context"; name: string }
+  | { type: "complete_setup"; contextName: string; provider: ProviderChoice }
   | { type: "create_context_configuration"; configuration: ContextConfiguration }
   | { type: "update_context"; contextId: number; name: string }
   | { type: "update_context_configuration"; contextId: number; configuration: ContextConfiguration }
@@ -101,6 +103,7 @@ export type Event =
 
 export type Effect =
   | { type: "persist_context"; context: Context; nextContextId: number }
+  | { type: "persist_setup"; provider: ProviderChoice }
   | {
       type: "persist_project";
       project: Project;

@@ -128,6 +128,10 @@ export class SqliteStore {
       );
     };
     switch (effect.type) {
+      case "persist_setup":
+        this.writeSetting("setup_completed", "true");
+        this.writeSetting("provider_choice", effect.provider);
+        break;
       case "persist_context": {
         const c = effect.context;
         db.prepare(
@@ -352,6 +356,16 @@ export class SqliteStore {
   }
   setting(key: string): string | null {
     return readSetting(this.database, key);
+  }
+  setSetting(key: string, value: string): void {
+    this.writeSetting(key, value);
+  }
+  private writeSetting(key: string, value: string): void {
+    this.database
+      .prepare(
+        "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      )
+      .run(key, value);
   }
   getSetupState(): SetupState {
     return getSetupState(this.database);
