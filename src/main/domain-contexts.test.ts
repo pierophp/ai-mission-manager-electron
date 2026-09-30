@@ -219,6 +219,6 @@ describe("Context decisions", () => {
       .map((entry) => ({ ...entry, context_id: 1 }));
     expect(() =>
       decide(state, { type: "update_context_configuration", contextId: 1, configuration }),
-    ).toThrow("is for claude, not codex");
+    ).toThrow("is for Claude, not Codex");
   });
 });

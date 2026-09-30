@@ -1,4 +1,19 @@
 import type { Context } from "../../domain/types";
+import type { MachineTransport } from "../../domain/types";
+
+/** Serializes the Rust internally-tagged enum and variant fields in declaration order. */
+export function encodeMachineTransport(transport: MachineTransport): string {
+  if (transport.kind === "local") return JSON.stringify({ kind: "local" });
+  return JSON.stringify({
+    kind: "ssh",
+    host: transport.host,
+    user: transport.user,
+    port: transport.port,
+    identity_file: transport.identityFile,
+    known_hosts_file: transport.knownHostsFile,
+    strict_host_key_checking: transport.strictHostKeyChecking,
+  });
+}
 
 /** Serializes the Rust PstackRoleTable JSON shape in struct declaration order. */
 export function encodePstackRoleTable(context: Context): string {

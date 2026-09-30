@@ -135,7 +135,7 @@ export function loadDomainState(database: DatabaseSync): DomainState {
       context_id: asNumber(row.context_id, "Context id"),
       name: asString(row.name, "Machine name"),
       socket_name: asString(row.socket_name, "Socket name"),
-      transport: parseJson(row.transport_json, "Machine transport"),
+      transport: decodeMachineTransport(parseJson(row.transport_json, "Machine transport")),
       last_observed: asString(row.last_observed, "Machine observation") as Machine["last_observed"],
       last_observed_at: optionalNumber(row.last_observed_at),
     }),
@@ -349,5 +349,32 @@ export function loadDomainState(database: DatabaseSync): DomainState {
     snapshots,
     activities,
     attention_defaults,
+  };
+}
+
+function decodeMachineTransport(value: unknown): Machine["transport"] {
+  if (!value || typeof value !== "object" || !("kind" in value))
+    throw new Error("Machine transport is invalid");
+  const transport = value as Record<string, unknown>;
+  if (transport.kind === "local") return { kind: "local" };
+  if (transport.kind !== "ssh") throw new Error("Machine transport is invalid");
+  return {
+    kind: "ssh",
+    host: String(transport.host ?? ""),
+    user: transport.user === null || transport.user === undefined ? null : String(transport.user),
+    port: transport.port === null || transport.port === undefined ? null : Number(transport.port),
+    identityFile:
+      transport.identity_file === null || transport.identity_file === undefined
+        ? null
+        : String(transport.identity_file),
+    knownHostsFile:
+      transport.known_hosts_file === null || transport.known_hosts_file === undefined
+        ? null
+        : String(transport.known_hosts_file),
+    strictHostKeyChecking:
+      transport.strict_host_key_checking === null ||
+      transport.strict_host_key_checking === undefined
+        ? null
+        : String(transport.strict_host_key_checking),
   };
 }

@@ -6,6 +6,10 @@ import type {
   Project,
   Repository,
   RepositoryLocation,
+  Machine,
+  MachineTransport,
+  CliConfigurationProfile,
+  AgentKind,
   WorkspaceRepositoryInput,
 } from "./types";
 import type { DomainState } from "./model";
@@ -52,6 +56,42 @@ export type Event =
       checkoutPath: string;
       worktreeRoot: string;
     }
+  | {
+      type: "register_machine";
+      contextId: number;
+      name: string;
+      socketName: string;
+      transport: MachineTransport;
+    }
+  | {
+      type: "update_machine";
+      machineId: number;
+      name: string;
+      socketName: string;
+      transport: MachineTransport;
+    }
+  | {
+      type: "observe_machine";
+      machineId: number;
+      observation: Machine["last_observed"];
+      observedAt: number;
+    }
+  | { type: "set_context_execution_machine"; contextId: number; machineId: number | null }
+  | {
+      type: "create_cli_configuration_profile";
+      machineId: number;
+      provider: AgentKind;
+      name: string;
+      directory: string;
+      appManaged: boolean;
+    }
+  | {
+      type: "set_context_cli_configuration_profile";
+      contextId: number;
+      provider: AgentKind;
+      profileId: number | null;
+    }
+  | { type: "delete_cli_configuration_profile"; profileId: number }
   | { type: "create_workspace"; itemId: number; repositories: WorkspaceRepositoryInput[] }
   | {
       type: "set_workspace_repositories";
@@ -83,6 +123,15 @@ export type Effect =
       previousMachineId: number | null;
       location: RepositoryLocation;
     }
+  | { type: "persist_machine"; machine: Machine; nextMachineId: number }
+  | { type: "update_machine"; machine: Machine }
+  | { type: "persist_machine_observation"; machine: Machine }
+  | {
+      type: "persist_cli_configuration_profile";
+      profile: CliConfigurationProfile;
+      nextCliProfileId: number;
+    }
+  | { type: "remove_cli_configuration_profile"; profileId: number }
   | {
       type: "persist_workspace";
       workspace: DomainState["workspaces"][number];

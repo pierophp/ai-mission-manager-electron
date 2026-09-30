@@ -138,7 +138,7 @@ if (!hasSingleInstance) {
       registerIpc(
         createCommandDispatcher({
           ...createReadCommandHandlers(store),
-          ...createStructureCommandHandlers(runtime),
+          ...createStructureCommandHandlers(runtime, undefined, store),
         }),
       );
       mainWindow = createWindow();

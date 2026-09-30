@@ -1,5 +1,6 @@
 import { DomainError } from "./error";
 import { defaultPstackRoles, type DomainState } from "./model";
+import { cleanMachineTransport } from "./machine-transport";
 import type {
   Context,
   ContextAttentionDefault,
@@ -7,6 +8,7 @@ import type {
   Project,
   Repository,
   WorkspaceRepositoryInput,
+  Machine,
 } from "./types";
 import type { Decision, Effect, Event } from "./events";
 
@@ -14,6 +16,8 @@ export function decide(state: DomainState, event: Event): Decision {
   const next = structuredClone(state);
   const effects: Effect[] = [];
   const clean = (value: string) => value.trim();
+  const debugProvider = (provider: "claude" | "codex") =>
+    provider === "claude" ? "Claude" : "Codex";
   const context = (id: number) => {
     const result = next.contexts.find((candidate) => candidate.id === id);
     if (!result) throw new DomainError(`Context ${id} does not exist`);
@@ -136,11 +140,23 @@ export function decide(state: DomainState, event: Event): Decision {
     if (!profile) throw new DomainError(`CLI configuration profile ${profileId} does not exist`);
     if (profile.provider !== provider)
       throw new DomainError(
-        `CLI configuration profile ${profileId} is for ${profile.provider}, not ${provider}`,
+        `CLI configuration profile ${profileId} is for ${debugProvider(profile.provider)}, not ${debugProvider(provider)}`,
       );
     if (machineId === null || profile.machineId !== machineId)
       throw new DomainError(`CLI configuration profile ${profileId} belongs to another Machine`);
   };
+  const contextItemIds = (contextId: number) =>
+    new Set(
+      next.projects
+        .filter((entry) => entry.context_id === contextId)
+        .flatMap((entry) =>
+          next.items.filter((item) => item.project_id === entry.id).map((item) => item.id),
+        ),
+    );
+  const runIsActive = (run: DomainState["runs"][number]) =>
+    run.state !== "finished" ||
+    (run.execution_profile === "grill" && run.grill_phase !== "finished") ||
+    (run.execution_profile === "plan" && run.plan_phase === "awaitingGo");
   const applyConfiguration = (
     id: number,
     configuration: ContextConfiguration,
@@ -149,21 +165,8 @@ export function decide(state: DomainState, event: Event): Decision {
     const value = context(id);
     const name = validateName(configuration.name, id);
     if (value.execution_machine_id !== configuration.executionMachineId) {
-      const itemIds = new Set(
-        next.projects
-          .filter((project) => project.context_id === id)
-          .flatMap((project) =>
-            next.items.filter((item) => item.project_id === project.id).map((item) => item.id),
-          ),
-      );
       const activeRunIds = next.runs
-        .filter(
-          (run) =>
-            itemIds.has(run.item_id) &&
-            (run.state !== "finished" ||
-              (run.execution_profile === "grill" && run.grill_phase !== "finished") ||
-              (run.execution_profile === "plan" && run.plan_phase === "awaitingGo")),
-        )
+        .filter((run) => contextItemIds(id).has(run.item_id) && runIsActive(run))
         .map((run) => run.id);
       if (activeRunIds.length)
         throw new DomainError(`Context ${id} has active Runs: [${activeRunIds.join(", ")}]`);
@@ -432,6 +435,163 @@ export function decide(state: DomainState, event: Event): Decision {
         previousMachineId: event.previousMachineId,
         location,
       });
+      break;
+    }
+    case "register_machine": {
+      context(event.contextId);
+      const name = clean(event.name);
+      const socketName = clean(event.socketName);
+      if (!name) throw new DomainError("a Machine name cannot be blank");
+      if (!socketName) throw new DomainError("a Machine socket name cannot be blank");
+      const transport = cleanMachineTransport(event.transport);
+      if (next.machines.some((m) => m.context_id === event.contextId && m.name === name))
+        throw new DomainError(`Machine name already exists in Context ${event.contextId}: ${name}`);
+      const id = next.next_machine_id;
+      const machine: Machine = {
+        id,
+        context_id: event.contextId,
+        name,
+        socket_name: socketName,
+        transport,
+        last_observed: "unknown",
+        last_observed_at: null,
+      };
+      next.next_machine_id++;
+      next.machines.push(machine);
+      effects.push({ type: "persist_machine", machine, nextMachineId: next.next_machine_id });
+      break;
+    }
+    case "update_machine": {
+      const current = next.machines.find((m) => m.id === event.machineId);
+      if (!current) throw new DomainError(`Machine ${event.machineId} does not exist`);
+      const name = clean(event.name);
+      const socketName = clean(event.socketName);
+      if (!name) throw new DomainError("a Machine name cannot be blank");
+      if (!socketName) throw new DomainError("a Machine socket name cannot be blank");
+      if (
+        next.machines.some(
+          (m) => m.id !== current.id && m.context_id === current.context_id && m.name === name,
+        )
+      )
+        throw new DomainError(
+          `Machine name already exists in Context ${current.context_id}: ${name}`,
+        );
+      current.name = name;
+      current.socket_name = socketName;
+      current.transport = cleanMachineTransport(event.transport);
+      effects.push({ type: "update_machine", machine: structuredClone(current) });
+      break;
+    }
+    case "observe_machine": {
+      const machine = next.machines.find((m) => m.id === event.machineId);
+      if (!machine) throw new DomainError(`Machine ${event.machineId} does not exist`);
+      machine.last_observed = event.observation;
+      machine.last_observed_at = event.observedAt;
+      effects.push({ type: "persist_machine_observation", machine: structuredClone(machine) });
+      break;
+    }
+    case "set_context_execution_machine": {
+      const value = context(event.contextId);
+      if (event.machineId !== null && !next.machines.some((m) => m.id === event.machineId))
+        throw new DomainError(`Machine ${event.machineId} does not exist`);
+      if (value.execution_machine_id !== event.machineId) {
+        const itemIds = contextItemIds(event.contextId);
+        const activeRunIds = next.runs
+          .filter((run) => itemIds.has(run.item_id) && runIsActive(run))
+          .map((run) => run.id);
+        if (activeRunIds.length)
+          throw new DomainError(
+            `Context ${event.contextId} has active Runs: [${activeRunIds.join(", ")}]`,
+          );
+      }
+      const usesLocalTracker = next.links.some(
+        (link) =>
+          next.external_objects.some(
+            (object) =>
+              object.id === link.external_object_id && object.external_key.startsWith("local:"),
+          ) &&
+          next.items.some(
+            (item) =>
+              item.id === link.item_id &&
+              next.projects.some(
+                (p) => p.id === item.project_id && p.context_id === event.contextId,
+              ),
+          ),
+      );
+      if (
+        usesLocalTracker &&
+        (event.machineId === null ||
+          next.machines.find((m) => m.id === event.machineId)?.transport.kind !== "local")
+      )
+        throw new DomainError(
+          `local Markdown tracker in Context ${event.contextId} requires a local execution Machine because its files are read from the Repository's main checkout`,
+        );
+      for (const [provider, profileId] of [
+        ["claude", value.claude_profile_id],
+        ["codex", value.codex_profile_id],
+      ] as const) {
+        if (profileId !== null && profileId !== undefined)
+          validateProfile(profileId, provider, event.machineId);
+      }
+      value.execution_machine_id = event.machineId;
+      effects.push({ type: "update_context", context: structuredClone(value) });
+      break;
+    }
+    case "create_cli_configuration_profile": {
+      const machine = next.machines.find((m) => m.id === event.machineId);
+      if (!machine) throw new DomainError(`Machine ${event.machineId} does not exist`);
+      const name = clean(event.name);
+      const directory = clean(event.directory);
+      if (!name) throw new DomainError("CLI configuration profile name cannot be blank");
+      if (!directory) throw new DomainError("CLI configuration profile directory cannot be blank");
+      if (
+        next.cli_configuration_profiles.some(
+          (p) =>
+            p.machineId === event.machineId && p.provider === event.provider && p.name === name,
+        )
+      )
+        throw new DomainError(
+          `CLI configuration profile name already exists on Machine ${event.machineId}: ${name}`,
+        );
+      const profile = {
+        id: next.next_cli_profile_id++,
+        machineId: event.machineId,
+        provider: event.provider,
+        name,
+        directory,
+        appManaged: event.appManaged,
+      };
+      next.cli_configuration_profiles.push(profile);
+      effects.push({
+        type: "persist_cli_configuration_profile",
+        profile,
+        nextCliProfileId: next.next_cli_profile_id,
+      });
+      break;
+    }
+    case "set_context_cli_configuration_profile": {
+      const value = context(event.contextId);
+      validateProfile(event.profileId, event.provider, value.execution_machine_id ?? null);
+      if (event.provider === "claude") value.claude_profile_id = event.profileId;
+      else value.codex_profile_id = event.profileId;
+      effects.push({ type: "update_context", context: structuredClone(value) });
+      break;
+    }
+    case "delete_cli_configuration_profile": {
+      const index = next.cli_configuration_profiles.findIndex((p) => p.id === event.profileId);
+      if (index < 0)
+        throw new DomainError(`CLI configuration profile ${event.profileId} does not exist`);
+      const contexts = next.contexts
+        .filter(
+          (c) => c.claude_profile_id === event.profileId || c.codex_profile_id === event.profileId,
+        )
+        .map((c) => c.name);
+      if (contexts.length)
+        throw new DomainError(
+          `CLI configuration profile is selected by Contexts: [${contexts.map((name) => JSON.stringify(name)).join(", ")}]`,
+        );
+      next.cli_configuration_profiles.splice(index, 1);
+      effects.push({ type: "remove_cli_configuration_profile", profileId: event.profileId });
       break;
     }
     case "create_workspace": {

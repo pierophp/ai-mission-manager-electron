@@ -7,6 +7,8 @@ import { createCommandDispatcher, invokeEnvelope } from "../../shared/ipc";
 import { createReadCommandHandlers } from "./commands";
 import { createStructureCommandHandlers } from "../structure-commands";
 import { openSqliteStore } from "./sqlite-store";
+import { Runtime } from "../runtime";
+import { FakeMachineAccess } from "../machine-access";
 
 const temporaryDirectories: string[] = [];
 function temporaryDatabase() {
@@ -20,6 +22,178 @@ afterEach(() => {
 });
 
 describe("Rust-compatible SQLite store", () => {
+  it("round trips Rust-shaped SSH transport JSON and dispatches Machine/Profile commands", async () => {
+    const store = openSqliteStore(temporaryDatabase());
+    const runtime = new Runtime(store);
+    const access = new FakeMachineAccess();
+    const handlers = createStructureCommandHandlers(runtime, access, store);
+    const dispatch = createCommandDispatcher({ ...createReadCommandHandlers(store), ...handlers });
+    const ssh = {
+      kind: "ssh" as const,
+      host: "build.example",
+      user: "piero",
+      port: 2222,
+      identityFile: "/tmp/build key",
+      knownHostsFile: "/tmp/known hosts",
+      strictHostKeyChecking: "accept-new",
+    };
+    const machine = await invokeEnvelope(dispatch, "register_machine", {
+      contextId: 1,
+      name: "Build",
+      socketName: "mission-build",
+      transport: ssh,
+    });
+    expect(machine).toMatchObject({ id: 1, name: "Build" });
+    expect(store.loadState().machines[0]).toMatchObject({ id: 1, transport: ssh });
+    const raw = new DatabaseSync(store.path, { readOnly: true });
+    expect(raw.prepare("SELECT transport_json FROM machines WHERE id=1").get()).toEqual({
+      transport_json:
+        '{"kind":"ssh","host":"build.example","user":"piero","port":2222,"identity_file":"/tmp/build key","known_hosts_file":"/tmp/known hosts","strict_host_key_checking":"accept-new"}',
+    });
+    raw.close();
+    await invokeEnvelope(dispatch, "set_context_execution_machine", { contextId: 1, machineId: 1 });
+    await invokeEnvelope(dispatch, "create_context", { name: "Shared" });
+    await invokeEnvelope(dispatch, "set_context_execution_machine", { contextId: 2, machineId: 1 });
+    const profile = (await invokeEnvelope(dispatch, "create_cli_configuration_profile", {
+      machineId: 1,
+      provider: "claude",
+      name: "Work",
+      appManaged: true,
+      existingDirectory: null,
+    })) as {
+      profile: {
+        id: number;
+        machineId: number;
+        provider: string;
+        name: string;
+        appManaged: boolean;
+      };
+      signInCommand: string;
+    };
+    expect(profile.profile).toMatchObject({
+      id: 1,
+      machineId: 1,
+      provider: "claude",
+      name: "Work",
+      appManaged: true,
+    });
+    expect(profile.signInCommand).toBe(
+      'CLAUDE_CONFIG_DIR="$HOME/.config/ai-mission-manager/cli-profiles/claude/1" claude',
+    );
+    let signalShellStarted!: () => void;
+    let releaseShell!: () => void;
+    const shellStarted = new Promise<void>((resolve) => {
+      signalShellStarted = resolve;
+    });
+    const shellGate = new Promise<void>((resolve) => {
+      releaseShell = resolve;
+    });
+    access.shellGate = shellGate;
+    access.onShellStart = signalShellStarted;
+    const createProfile = (name: string) =>
+      invokeEnvelope(dispatch, "create_cli_configuration_profile", {
+        machineId: 1,
+        provider: "claude",
+        name,
+        appManaged: true,
+        existingDirectory: null,
+      });
+    const firstCreation = createProfile("Concurrent A");
+    await shellStarted;
+    const secondCreation = createProfile("Concurrent B");
+    releaseShell();
+    const concurrentProfiles = await Promise.all([firstCreation, secondCreation]);
+    expect(
+      concurrentProfiles.map((result) => (result as { profile: { id: number } }).profile.id),
+    ).toEqual([2, 3]);
+    expect(
+      access.calls.filter(({ operation }) => operation === "shell").map(({ command }) => command),
+    ).toEqual([
+      'mkdir -p -- "$HOME/.config/ai-mission-manager/cli-profiles/claude/1"',
+      'mkdir -p -- "$HOME/.config/ai-mission-manager/cli-profiles/claude/2"',
+      'mkdir -p -- "$HOME/.config/ai-mission-manager/cli-profiles/claude/3"',
+    ]);
+    access.shellGate = undefined;
+    access.onShellStart = undefined;
+    await expect(
+      invokeEnvelope(dispatch, "create_cli_configuration_profile", {
+        machineId: 1,
+        provider: "claude",
+        name: "Work",
+        appManaged: true,
+        existingDirectory: null,
+      }),
+    ).rejects.toBeTruthy();
+    expect(access.calls.map(({ operation }) => operation)).toEqual(["shell", "shell", "shell"]);
+    await invokeEnvelope(dispatch, "set_context_cli_configuration_profile", {
+      contextId: 1,
+      provider: "claude",
+      profileId: 1,
+    });
+    await invokeEnvelope(dispatch, "set_context_cli_configuration_profile", {
+      contextId: 2,
+      provider: "claude",
+      profileId: 1,
+    });
+    expect(await invokeEnvelope(dispatch, "check_machine", { machineId: 1 })).toMatchObject({
+      last_observed: "available",
+      readiness: { reachable: true, tmuxAvailable: true },
+    });
+    expect(await invokeEnvelope(dispatch, "list_machines")).toMatchObject([
+      { id: 1, last_observed: "available", readiness: { reachable: true, tmuxAvailable: true } },
+    ]);
+    expect(access.calls.map(({ operation }) => operation)).toEqual([
+      "shell",
+      "shell",
+      "shell",
+      "check",
+    ]);
+    const offlineAccess = new FakeMachineAccess("", {
+      reachable: false,
+      tmuxAvailable: null,
+      bunAvailable: null,
+      bunError: null,
+      stateDirectoryWritable: null,
+      error: "Could not reach Machine Build: Connection timed out",
+    });
+    const offlineDispatch = createCommandDispatcher({
+      ...createReadCommandHandlers(store),
+      ...createStructureCommandHandlers(runtime, offlineAccess, store),
+    });
+    expect(await invokeEnvelope(offlineDispatch, "check_machine", { machineId: 1 })).toMatchObject({
+      last_observed: "offline",
+      readiness: {
+        reachable: false,
+        tmuxAvailable: null,
+        error: "Could not reach Machine Build: Connection timed out",
+      },
+    });
+    await expect(
+      invokeEnvelope(dispatch, "set_context_cli_configuration_profile", {
+        contextId: 1,
+        provider: "codex",
+        profileId: 1,
+      }),
+    ).rejects.toEqual("CLI configuration profile 1 is for Claude, not Codex");
+    await expect(
+      invokeEnvelope(dispatch, "delete_cli_configuration_profile", { profileId: 1 }),
+    ).rejects.toEqual('CLI configuration profile is selected by Contexts: ["Personal", "Shared"]');
+    await invokeEnvelope(dispatch, "set_context_cli_configuration_profile", {
+      contextId: 1,
+      provider: "claude",
+      profileId: null,
+    });
+    await invokeEnvelope(dispatch, "set_context_cli_configuration_profile", {
+      contextId: 2,
+      provider: "claude",
+      profileId: null,
+    });
+    expect(
+      await invokeEnvelope(dispatch, "delete_cli_configuration_profile", { profileId: 1 }),
+    ).toBeNull();
+    store.close();
+  });
+
   it("creates the Rust-openable Personal and Default seed using DELETE journaling", () => {
     const databasePath = temporaryDatabase();
     const store = openSqliteStore(databasePath);

@@ -10,9 +10,31 @@ import type {
   Project,
   Repository,
   RepositoryLocation,
+  Machine,
+  MachineTransport,
+  AgentKind,
+  MachineReadiness,
+  CliProfileSettingsView,
 } from "../domain/types";
+import { LocalSshMachineAccess, type MachineAccess } from "./machine-access";
+import type { SqliteStore } from "./persistence/sqlite-store";
+import { decide } from "../domain/state-transition";
 
-export function createStructureCommandHandlers(runtime: Runtime) {
+export function createStructureCommandHandlers(
+  runtime: Runtime,
+  machineAccess: MachineAccess = new LocalSshMachineAccess(),
+  store?: SqliteStore,
+) {
+  const machineCheckGenerations = new Map<number, number>();
+  let profileCreationQueue: Promise<void> = Promise.resolve();
+  const serializeProfileCreation = <T>(operation: () => Promise<T>): Promise<T> => {
+    const result = profileCreationQueue.then(operation, operation);
+    profileCreationQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
   const dispatchAndSelectContext = (event: Event, contextId?: number) => {
     const state = runtime.dispatch(event);
     return state.contexts.find((entry) => entry.id === contextId) ?? state.contexts.at(-1);
@@ -168,6 +190,135 @@ export function createStructureCommandHandlers(runtime: Runtime) {
       return state.repository_locations.find(
         (location) => location.repository_id === repositoryId && location.machine_id === machineId,
       );
+    },
+    register_machine: (args: Record<string, unknown>): Machine => {
+      const id = runtime.snapshot().next_machine_id;
+      const state = runtime.dispatch({
+        type: "register_machine",
+        contextId: Number(args.contextId),
+        name: String(args.name ?? ""),
+        socketName: String(args.socketName ?? ""),
+        transport: args.transport as MachineTransport,
+      });
+      return state.machines.find((entry) => entry.id === id)!;
+    },
+    update_machine: (args: Record<string, unknown>): Machine => {
+      const machineId = Number(args.machineId);
+      machineCheckGenerations.set(machineId, (machineCheckGenerations.get(machineId) ?? 0) + 1);
+      const state = runtime.dispatch({
+        type: "update_machine",
+        machineId,
+        name: String(args.name ?? ""),
+        socketName: String(args.socketName ?? ""),
+        transport: args.transport as MachineTransport,
+      });
+      store?.setMachineReadiness(machineId, null);
+      return state.machines.find((entry) => entry.id === machineId)!;
+    },
+    set_context_execution_machine: (args: Record<string, unknown>) => {
+      const contextId = Number(args.contextId);
+      const state = runtime.dispatch({
+        type: "set_context_execution_machine",
+        contextId,
+        machineId:
+          args.machineId === null || args.machineId === undefined ? null : Number(args.machineId),
+      });
+      return state.contexts.find((entry) => entry.id === contextId);
+    },
+    create_cli_configuration_profile: (
+      args: Record<string, unknown>,
+    ): Promise<CliProfileSettingsView> =>
+      serializeProfileCreation(async () => {
+        const machineId = Number(args.machineId);
+        const provider = args.provider as AgentKind;
+        const appManaged = Boolean(args.appManaged);
+        const directory = appManaged
+          ? `~/.config/ai-mission-manager/cli-profiles/${provider}/${runtime.snapshot().next_cli_profile_id}`
+          : String(args.existingDirectory ?? "");
+        const event: Event = {
+          type: "create_cli_configuration_profile",
+          machineId,
+          provider,
+          name: String(args.name ?? ""),
+          directory,
+          appManaged,
+        };
+        // Validate before making a directory on the target Machine.
+        decide(runtime.snapshot(), event);
+        if (appManaged) {
+          const machine = runtime.snapshot().machines.find((entry) => entry.id === machineId);
+          if (!machine) throw new Error(`Machine ${machineId} does not exist`);
+          const relativePath = directory.slice(2);
+          await machineAccess.runShell(machine, `mkdir -p -- "$HOME/${relativePath}"`);
+        }
+        const state = runtime.dispatch(event);
+        const profile = state.cli_configuration_profiles.at(-1)!;
+        return {
+          profile,
+          signInCommand: appManaged
+            ? `${provider === "claude" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME"}="$HOME/${directory.slice(2)}" ${provider === "claude" ? "claude" : "codex login"}`
+            : null,
+        };
+      }),
+    set_context_cli_configuration_profile: (args: Record<string, unknown>) => {
+      const contextId = Number(args.contextId);
+      const state = runtime.dispatch({
+        type: "set_context_cli_configuration_profile",
+        contextId,
+        provider: args.provider as AgentKind,
+        profileId:
+          args.profileId === null || args.profileId === undefined ? null : Number(args.profileId),
+      });
+      return state.contexts.find((entry) => entry.id === contextId);
+    },
+    delete_cli_configuration_profile: (args: Record<string, unknown>) => {
+      runtime.dispatch({
+        type: "delete_cli_configuration_profile",
+        profileId: Number(args.profileId),
+      });
+      return null;
+    },
+    check_machine: async (args: Record<string, unknown>) => {
+      const machineId = Number(args.machineId);
+      const machine = runtime.snapshot().machines.find((entry) => entry.id === machineId);
+      if (!machine) throw new Error(`Machine ${machineId} does not exist`);
+      const generation = (machineCheckGenerations.get(machineId) ?? 0) + 1;
+      machineCheckGenerations.set(machineId, generation);
+      const observed = await machineAccess.checkMachine(machine);
+      if (machineCheckGenerations.get(machineId) !== generation)
+        throw new Error(`Machine ${machineId} check result was superseded by a newer check`);
+      const current = runtime.snapshot().machines.find((entry) => entry.id === machineId);
+      if (!current) throw new Error(`Machine ${machineId} no longer exists`);
+      if (
+        current.context_id !== machine.context_id ||
+        current.name !== machine.name ||
+        current.socket_name !== machine.socket_name ||
+        JSON.stringify(current.transport) !== JSON.stringify(machine.transport)
+      )
+        throw new Error(`Machine ${machineId} changed while it was being checked; check it again`);
+      const observedAt = Math.floor(Date.now() / 1000);
+      const state = runtime.dispatch({
+        type: "observe_machine",
+        machineId,
+        observation: observed.reachable && observed.tmuxAvailable ? "available" : "offline",
+        observedAt,
+      });
+      const updated = state.machines.find((entry) => entry.id === machineId)!;
+      const readiness: MachineReadiness = {
+        reachable: observed.reachable,
+        tmuxAvailable: observed.tmuxAvailable,
+        bunAvailable: observed.bunAvailable,
+        bunError: observed.bunError,
+        claudeExecutableResolved: null,
+        codexExecutableResolved: null,
+        stateDirectoryWritable: observed.stateDirectoryWritable,
+        claudeHooks: { provisioned: null, current: null, error: null },
+        codexHooks: { provisioned: null, current: null, error: null },
+        lastProvisioningError: null,
+        error: observed.error,
+      };
+      store?.setMachineReadiness(machineId, readiness);
+      return { ...updated, readiness };
     },
   };
 }

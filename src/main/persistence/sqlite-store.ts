@@ -7,6 +7,7 @@ import type {
   ContextAttentionDefault,
   Item,
   Machine,
+  MachineReadiness,
   Project,
   Repository,
   RepositoryLocation,
@@ -30,6 +31,7 @@ import {
 import { openSqliteDatabase } from "./schema";
 import {
   encodeContextCreatedAudit,
+  encodeMachineTransport,
   encodeProjectCreatedAudit,
   encodePstackRoleTable,
   encodeRepositoryRegisteredAudit,
@@ -43,6 +45,7 @@ export function openSqliteStore(databasePath?: string): SqliteStore {
 
 /** Persistence facade consumed by the application layer. */
 export class SqliteStore {
+  private readonly machineReadiness = new Map<number, MachineReadiness>();
   constructor(
     private readonly database: DatabaseSync,
     readonly path: string,
@@ -217,6 +220,59 @@ export class SqliteStore {
           effect.location.worktree_root,
         );
         break;
+      case "persist_machine":
+        db.prepare(
+          "INSERT INTO machines(id,context_id,name,socket_name,transport_json,last_observed,last_observed_at) VALUES(?,?,?,?,?,?,?)",
+        ).run(
+          effect.machine.id,
+          effect.machine.context_id,
+          effect.machine.name,
+          effect.machine.socket_name,
+          encodeMachineTransport(effect.machine.transport),
+          effect.machine.last_observed,
+          effect.machine.last_observed_at,
+        );
+        db.prepare("UPDATE metadata SET value=? WHERE key='next_machine_id'").run(
+          effect.nextMachineId,
+        );
+        break;
+      case "update_machine":
+        db.prepare(
+          "UPDATE machines SET name=?,socket_name=?,transport_json=?,last_observed=?,last_observed_at=? WHERE id=?",
+        ).run(
+          effect.machine.name,
+          effect.machine.socket_name,
+          encodeMachineTransport(effect.machine.transport),
+          effect.machine.last_observed,
+          effect.machine.last_observed_at,
+          effect.machine.id,
+        );
+        break;
+      case "persist_machine_observation":
+        db.prepare("UPDATE machines SET last_observed=?,last_observed_at=? WHERE id=?").run(
+          effect.machine.last_observed,
+          effect.machine.last_observed_at,
+          effect.machine.id,
+        );
+        break;
+      case "persist_cli_configuration_profile":
+        db.prepare(
+          "INSERT INTO cli_configuration_profiles(id,machine_id,provider,name,directory,app_managed) VALUES(?,?,?,?,?,?)",
+        ).run(
+          effect.profile.id,
+          effect.profile.machineId,
+          effect.profile.provider,
+          effect.profile.name,
+          effect.profile.directory,
+          Number(effect.profile.appManaged),
+        );
+        db.prepare("UPDATE metadata SET value=? WHERE key='next_cli_profile_id'").run(
+          effect.nextCliProfileId,
+        );
+        break;
+      case "remove_cli_configuration_profile":
+        db.prepare("DELETE FROM cli_configuration_profiles WHERE id=?").run(effect.profileId);
+        break;
       case "persist_workspace":
         db.prepare("INSERT INTO workspaces(id,item_id,preparation_state) VALUES(?,?,?)").run(
           effect.workspace.id,
@@ -316,7 +372,14 @@ export class SqliteStore {
     return listRepositoryLocations(this.database);
   }
   listMachines(): Machine[] {
-    return listMachines(this.database);
+    return listMachines(this.database).map((machine) => ({
+      ...machine,
+      readiness: this.machineReadiness.get(machine.id) ?? null,
+    }));
+  }
+  setMachineReadiness(machineId: number, readiness: MachineReadiness | null): void {
+    if (readiness) this.machineReadiness.set(machineId, readiness);
+    else this.machineReadiness.delete(machineId);
   }
   listCliConfigurationProfiles(): CliProfileSettingsView[] {
     return listCliConfigurationProfiles(this.database);
