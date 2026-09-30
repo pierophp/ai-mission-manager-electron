@@ -1,0 +1,18 @@
+{
+  "fixtureVersion": 1,
+  "source": "Rust persistence test harness using SqliteStore::open and load_state",
+  "rustSource": {
+    "repository": "pierophp/ai-mission-manager",
+    "commit": "ef5d3be81777192f01400cbd8dcd7170b3f76813",
+    "fixtureGenerator": "src-tauri/src/persistence/tests.rs"
+  },
+  "typescriptDatabaseOpenValidation": {
+    "rustApi": "src-tauri/src/persistence.rs::SqliteStore::open",
+    "command": "cargo test open_typescript_created_database",
+    "result": "passed against a fresh database created by this SqliteStore",
+    "note": "One-off cross-runtime validation; the temporary Rust test was removed after the run."
+  },
+  "artifacts": ["rust-persistence.sqlite", "domain-state.json"],
+  "coverage": "All persisted tables, including populated JSON columns; expected state captured from Rust load_state",
+  "fixturePreparation": "After Rust capture, settings contains setup_completed=true and provider_choice=none so every persisted table has a row. These settings do not participate in DomainState."
+}

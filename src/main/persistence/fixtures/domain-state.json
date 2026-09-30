@@ -1,0 +1,413 @@
+{
+  "next_context_id": 2,
+  "next_project_id": 2,
+  "next_item_id": 1,
+  "next_item_number": 1,
+  "next_repository_id": 1,
+  "next_workspace_id": 1,
+  "next_worktree_id": 1,
+  "next_machine_id": 1,
+  "next_cli_profile_id": 1,
+  "next_run_id": 1,
+  "next_external_object_id": 1,
+  "next_link_id": 1,
+  "next_activity_id": 1,
+  "next_reminder_id": 1,
+  "contexts": [
+    {
+      "id": 1,
+      "name": "Personal",
+      "execution_machine_id": null,
+      "claude_profile_id": null,
+      "codex_profile_id": null,
+      "check_dirty_checkouts": true,
+      "grill_defaults": {
+        "agent": "claude",
+        "model": "claude-sonnet-5",
+        "effort": "high"
+      },
+      "implement_defaults": {
+        "agent": "claude",
+        "model": "claude-sonnet-5",
+        "effort": "high"
+      },
+      "default_workflow": "matt-pocock",
+      "pstack_defaults": {
+        "agent": "claude",
+        "model": "claude-sonnet-5",
+        "effort": "high"
+      },
+      "pstack_roles": [
+        {
+          "role": "code-delegate",
+          "configuration": {
+            "agent": "claude",
+            "model": "claude-opus-5",
+            "effort": "high"
+          }
+        },
+        {
+          "role": "judge-and-prose",
+          "configuration": {
+            "agent": "codex",
+            "model": "gpt-6-sol",
+            "effort": "high"
+          }
+        },
+        {
+          "role": "review-panel",
+          "configuration": {
+            "agent": "codex",
+            "model": "gpt-6-sol",
+            "effort": "high"
+          }
+        },
+        {
+          "role": "explorers",
+          "configuration": {
+            "agent": "claude",
+            "model": "claude-sonnet-5",
+            "effort": "medium"
+          }
+        }
+      ],
+      "gh_executable_path": null,
+      "twg_executable_path": null,
+      "az_executable_path": null,
+      "atlassian_site": null,
+      "azure_devops_organization": null,
+      "bitbucket_workspace": null
+    },
+    {
+      "id": 2,
+      "name": "Research",
+      "execution_machine_id": null,
+      "claude_profile_id": null,
+      "codex_profile_id": null,
+      "check_dirty_checkouts": true,
+      "grill_defaults": {
+        "agent": "claude",
+        "model": "claude-sonnet-5",
+        "effort": "high"
+      },
+      "implement_defaults": {
+        "agent": "claude",
+        "model": "claude-sonnet-5",
+        "effort": "high"
+      },
+      "default_workflow": "matt-pocock",
+      "pstack_defaults": {
+        "agent": "claude",
+        "model": "claude-sonnet-5",
+        "effort": "high"
+      },
+      "pstack_roles": [
+        {
+          "role": "code-delegate",
+          "configuration": {
+            "agent": "claude",
+            "model": "claude-opus-5",
+            "effort": "high"
+          }
+        },
+        {
+          "role": "judge-and-prose",
+          "configuration": {
+            "agent": "codex",
+            "model": "gpt-6-sol",
+            "effort": "high"
+          }
+        },
+        {
+          "role": "review-panel",
+          "configuration": {
+            "agent": "codex",
+            "model": "gpt-6-sol",
+            "effort": "high"
+          }
+        },
+        {
+          "role": "explorers",
+          "configuration": {
+            "agent": "claude",
+            "model": "claude-sonnet-5",
+            "effort": "medium"
+          }
+        }
+      ],
+      "gh_executable_path": null,
+      "twg_executable_path": null,
+      "az_executable_path": null,
+      "atlassian_site": null,
+      "azure_devops_organization": null,
+      "bitbucket_workspace": null
+    }
+  ],
+  "projects": [
+    {
+      "id": 1,
+      "context_id": 1,
+      "name": "Default",
+      "defaults": {
+        "item_status": "Inbox",
+        "execution_mode": "worktree"
+      }
+    },
+    {
+      "id": 2,
+      "context_id": 2,
+      "name": "Tools",
+      "defaults": {
+        "item_status": "Active",
+        "execution_mode": "worktree"
+      }
+    }
+  ],
+  "repositories": [
+    {
+      "id": 1,
+      "project_id": 1,
+      "name": "app",
+      "remote_url": "git@github.com:acme/app.git",
+      "base_branch": "main"
+    }
+  ],
+  "repository_locations": [
+    {
+      "repository_id": 1,
+      "machine_id": 1,
+      "checkout_path": "/repos/app",
+      "worktree_root": "/worktrees"
+    }
+  ],
+  "items": [
+    {
+      "id": 1,
+      "human_identifier": "I-1",
+      "title": "Fixture item",
+      "project_id": 1,
+      "status": "Active",
+      "notes": "fixture notes",
+      "reminders": [
+        {
+          "id": 1,
+          "remind_at": "2026-10-01T09:00"
+        }
+      ]
+    }
+  ],
+  "workspaces": [
+    {
+      "id": 1,
+      "item_id": 1,
+      "repositories": [
+        {
+          "repositoryId": 1,
+          "branch": "feature/fixture",
+          "baseBranch": "main"
+        }
+      ],
+      "preparation_state": "ready"
+    }
+  ],
+  "worktrees": [
+    {
+      "id": 1,
+      "workspaceId": 1,
+      "repositoryId": 1,
+      "machineId": 1,
+      "path": "/worktrees/fixture",
+      "branch": "feature/fixture",
+      "baseBranch": "main",
+      "isDirty": false
+    }
+  ],
+  "machines": [
+    {
+      "id": 1,
+      "context_id": 1,
+      "name": "Local",
+      "socket_name": "default",
+      "transport": {
+        "kind": "local"
+      },
+      "last_observed": "available",
+      "last_observed_at": null
+    }
+  ],
+  "cli_configuration_profiles": [
+    {
+      "id": 1,
+      "machineId": 1,
+      "provider": "claude",
+      "name": "Work",
+      "directory": "/profiles/claude",
+      "appManaged": true
+    }
+  ],
+  "runs": [
+    {
+      "id": 1,
+      "item_id": 1,
+      "workspace_id": 1,
+      "repository_id": 1,
+      "worktree_id": 1,
+      "machine_id": 1,
+      "agent": "claude",
+      "cli_configuration_profile": {
+        "profileId": 1,
+        "provider": "claude",
+        "name": "Work"
+      },
+      "execution_profile": "implement",
+      "workflow": "matt-pocock",
+      "model": "claude-sonnet-5",
+      "effort": "high",
+      "skill_snapshot": "skill",
+      "prompt": "Build fixture",
+      "working_directory": "/repos/app",
+      "session_name": "mission-item-1-run-1",
+      "pane_id": "%1",
+      "started_at": 100,
+      "state": "working",
+      "last_applied_agent_state_sequence": null,
+      "pane_status": "available",
+      "direct_checkouts": [
+        {
+          "repositoryId": 1,
+          "path": "/repos/app",
+          "branch": "main",
+          "isDirty": false
+        }
+      ],
+      "transcript": "",
+      "reported_pull_requests": ["https://github.com/acme/app/pull/2"],
+      "attention_summary": null,
+      "grill_question_group": {
+        "round": 1,
+        "questions": [
+          {
+            "number": 1,
+            "title": null,
+            "prompt": "Why?",
+            "recommendation": null,
+            "options": []
+          }
+        ]
+      },
+      "grill_answers": [
+        {
+          "questionNumber": 1,
+          "answer": "because"
+        }
+      ],
+      "grill_decisions": [],
+      "grill_response": null,
+      "grill_phase": "waitingForAnswers",
+      "grill_action": "to-spec",
+      "grill_action_started_at": null,
+      "plan_phase": "awaitingGo",
+      "plan_path": "/tmp/plan.md"
+    }
+  ],
+  "implementation_queues": [
+    {
+      "id": 1,
+      "itemId": 1,
+      "specExternalObjectId": 1,
+      "specUrl": "https://github.com/acme/app/issues/1",
+      "workspaceId": 1,
+      "repositoryId": 1,
+      "configuration": {
+        "agent": "claude",
+        "model": "claude-sonnet-5",
+        "effort": "high"
+      },
+      "allowDirty": false,
+      "allowSharedCheckouts": false,
+      "entries": [],
+      "active": true,
+      "pausedReason": null
+    }
+  ],
+  "relationships": [
+    {
+      "from_item_id": 1,
+      "to_item_id": 1,
+      "kind": "RelatedTo"
+    }
+  ],
+  "external_objects": [
+    {
+      "id": 1,
+      "provider": "github",
+      "kind": "issue",
+      "external_key": "acme/app#1",
+      "canonical_url": "https://github.com/acme/app/issues/1"
+    }
+  ],
+  "links": [
+    {
+      "id": 1,
+      "item_id": 1,
+      "external_object_id": 1,
+      "reviewed_activity_id": 0,
+      "attention_policy": {
+        "title": true,
+        "state": false,
+        "metadata": true
+      },
+      "watch_until": "2026-10-01T09:00",
+      "review_at": null,
+      "purpose": "to-spec",
+      "spec_external_object_id": null,
+      "provenance": {
+        "run_id": 1,
+        "action": "to-spec",
+        "discovery": "structured-event",
+        "ordinal": 1,
+        "blocked_by": []
+      }
+    }
+  ],
+  "snapshots": [
+    {
+      "external_object_id": 1,
+      "title": "Fixture issue",
+      "state": "open",
+      "metadata": [
+        {
+          "key": "assignee",
+          "value": "agent"
+        }
+      ],
+      "fetched_at": 100
+    }
+  ],
+  "activities": [
+    {
+      "id": 1,
+      "external_object_id": 1,
+      "observed_at": 100,
+      "changes": [
+        {
+          "kind": "title",
+          "key": null,
+          "previous": null,
+          "current": "Fixture issue"
+        }
+      ]
+    }
+  ],
+  "attention_defaults": [
+    {
+      "context_id": 2,
+      "object_kind": "issue",
+      "policy": {
+        "title": true,
+        "state": true,
+        "metadata": false
+      }
+    }
+  ]
+}

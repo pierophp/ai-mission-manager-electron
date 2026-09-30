@@ -3,6 +3,9 @@ import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 import { createCommandDispatcher, INVOKE_CHANNEL } from "./shared/ipc";
+import { createReadCommandHandlers } from "./main/persistence/commands";
+import { openSqliteStore, type SqliteStore } from "./main/persistence/sqlite-store";
+import { ensureProjectWorkspaces, recoverRunStateRecords } from "./main/persistence/startup";
 
 const execFileAsync = promisify(execFile);
 const hasSingleInstance = app.requestSingleInstanceLock();
@@ -11,6 +14,7 @@ if (!hasSingleInstance) {
   app.quit();
 } else {
   let mainWindow: BrowserWindow | undefined;
+  let store: SqliteStore | undefined;
 
   app.on("second-instance", () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -18,16 +22,15 @@ if (!hasSingleInstance) {
     mainWindow.focus();
   });
 
-  const dispatchCommand = createCommandDispatcher();
-
-  function registerIpc() {
+  function registerIpc(dispatchCommand: ReturnType<typeof createCommandDispatcher>) {
     ipcMain.handle(INVOKE_CHANNEL, (_event, name: unknown, args: unknown) => {
       if (typeof name !== "string") {
         return { ok: false, error: "nome de comando inválido" };
       }
-      const safeArgs = args && typeof args === "object" && !Array.isArray(args)
-        ? args as Record<string, unknown>
-        : {};
+      const safeArgs =
+        args && typeof args === "object" && !Array.isArray(args)
+          ? (args as Record<string, unknown>)
+          : {};
       return dispatchCommand(name, safeArgs);
     });
   }
@@ -35,10 +38,13 @@ if (!hasSingleInstance) {
   async function importLoginShellPath() {
     const shellPath = process.env.SHELL || "/bin/zsh";
     try {
-      const { stdout } = await execFileAsync(shellPath, ["-lc", "printf %s \"$PATH\""]);
+      const { stdout } = await execFileAsync(shellPath, ["-lc", 'printf %s "$PATH"']);
       const loginPath = stdout.trim();
       if (loginPath) {
-        const pathEntries = [...loginPath.split(path.delimiter), ...(process.env.PATH ?? "").split(path.delimiter)];
+        const pathEntries = [
+          ...loginPath.split(path.delimiter),
+          ...(process.env.PATH ?? "").split(path.delimiter),
+        ];
         process.env.PATH = [...new Set(pathEntries.filter(Boolean))].join(path.delimiter);
       }
     } catch {
@@ -77,18 +83,21 @@ if (!hasSingleInstance) {
     return window;
   }
 
-  ipcMain.handle("desktop:open-directory-dialog", async (event, pickerOptions: { title?: string; defaultPath?: string } = {}) => {
-    const owner = BrowserWindow.fromWebContents(event.sender);
-    const dialogOptions: Electron.OpenDialogOptions = {
-      title: pickerOptions.title,
-      defaultPath: pickerOptions.defaultPath,
-      properties: ["openDirectory", "createDirectory"],
-    };
-    const result = owner
-      ? await dialog.showOpenDialog(owner, dialogOptions)
-      : await dialog.showOpenDialog(dialogOptions);
-    return result.canceled ? null : result.filePaths[0] ?? null;
-  });
+  ipcMain.handle(
+    "desktop:open-directory-dialog",
+    async (event, pickerOptions: { title?: string; defaultPath?: string } = {}) => {
+      const owner = BrowserWindow.fromWebContents(event.sender);
+      const dialogOptions: Electron.OpenDialogOptions = {
+        title: pickerOptions.title,
+        defaultPath: pickerOptions.defaultPath,
+        properties: ["openDirectory", "createDirectory"],
+      };
+      const result = owner
+        ? await dialog.showOpenDialog(owner, dialogOptions)
+        : await dialog.showOpenDialog(dialogOptions);
+      return result.canceled ? null : (result.filePaths[0] ?? null);
+    },
+  );
 
   ipcMain.handle("desktop:reveal-item-in-dir", (_event, filePath: string) => {
     if (typeof filePath !== "string") throw new Error("caminho inválido");
@@ -110,21 +119,39 @@ if (!hasSingleInstance) {
 
   app.on("web-contents-created", (_event, contents) => {
     contents.on("will-navigate", (navigationEvent, url) => {
-      if (process.env.ELECTRON_RENDERER_URL && url.startsWith(process.env.ELECTRON_RENDERER_URL)) return;
+      if (process.env.ELECTRON_RENDERER_URL && url.startsWith(process.env.ELECTRON_RENDERER_URL))
+        return;
       navigationEvent.preventDefault();
     });
   });
 
   app.whenReady().then(async () => {
     await importLoginShellPath();
-    registerIpc();
-    mainWindow = createWindow();
+    try {
+      store = openSqliteStore();
+      const state = store.loadState();
+      ensureProjectWorkspaces(state);
+      recoverRunStateRecords(state);
+      registerIpc(createCommandDispatcher(createReadCommandHandlers(store)));
+      mainWindow = createWindow();
+    } catch (error) {
+      dialog.showErrorBox(
+        "AI Mission Manager",
+        error instanceof Error ? error.message : String(error),
+      );
+      app.quit();
+      return;
+    }
 
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow();
     });
   });
 
-  app.on("window-all-closed", () => app.quit());
+  app.on("before-quit", () => {
+    store?.close();
+    store = undefined;
+  });
 
+  app.on("window-all-closed", () => app.quit());
 }

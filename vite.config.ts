@@ -11,7 +11,11 @@ export default defineConfig({
     alias: { "@": path.resolve(process.cwd(), "src/renderer") },
   },
   test: {
-    include: ["**/*.{test,spec}.{js,ts,jsx,tsx}", "../shared/**/*.{test,spec}.{js,ts,jsx,tsx}"],
+    include: [
+      "**/*.{test,spec}.{js,ts,jsx,tsx}",
+      "../shared/**/*.{test,spec}.{js,ts,jsx,tsx}",
+      "../main/**/*.{test,spec}.{js,ts,jsx,tsx}",
+    ],
     environment: "happy-dom",
   },
   server: {
