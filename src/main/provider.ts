@@ -325,6 +325,16 @@ function assertResult(
 
 export class ProviderDispatch {
   constructor(private readonly config: ProviderConfig = {}) {}
+  resolveExecutable(provider: Exclude<ExternalObject["provider"], "generic">): Promise<string> {
+    const name = provider === "github" ? "gh" : provider === "atlassian" ? "twg" : "az";
+    const configured =
+      provider === "github"
+        ? this.config.ghPath
+        : provider === "atlassian"
+          ? this.config.twgPath
+          : this.config.azPath;
+    return resolveExecutable(configured, name);
+  }
   private async invoke(
     provider: ExternalObject["provider"],
     args: string[],

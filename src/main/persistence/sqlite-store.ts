@@ -38,6 +38,7 @@ import {
   encodeRepositoryRegisteredAudit,
   encodeExternalMetadata,
   encodeExternalChanges,
+  encodeLinkProvenance,
 } from "./write-codecs";
 import { getSetupState, newContextConfiguration, readSetting } from "./settings";
 
@@ -56,6 +57,19 @@ export class SqliteStore {
 
   close(): void {
     this.database.close();
+  }
+  setContextProviderExecutable(
+    contextId: number,
+    provider: "github" | "atlassian" | "azure_dev_ops",
+    executable: string,
+  ): void {
+    const column =
+      provider === "github"
+        ? "gh_executable_path"
+        : provider === "atlassian"
+          ? "twg_executable_path"
+          : "az_executable_path";
+    this.database.prepare(`UPDATE contexts SET ${column}=? WHERE id=?`).run(executable, contextId);
   }
   commit(decision: Decision): void {
     const auditEffects = decision.effects.filter(
@@ -489,7 +503,7 @@ export class SqliteStore {
         link.attention_policy === null ? null : Number(link.attention_policy.metadata),
         link.watch_until,
         link.review_at,
-        link.provenance === null ? null : JSON.stringify(link.provenance),
+        encodeLinkProvenance(link),
       );
     this.database
       .prepare("UPDATE external_links SET purpose=?,spec_external_object_id=? WHERE id=?")

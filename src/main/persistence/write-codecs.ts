@@ -2,6 +2,7 @@ import type { Context } from "../../domain/types";
 import type { MachineTransport } from "../../domain/types";
 import type { ItemRelation } from "../../domain/types";
 import type { Activity, ExternalMetadata } from "../../domain/types";
+import type { ExternalLink } from "../../domain/types";
 
 /** Serializes the Rust internally-tagged enum and variant fields in declaration order. */
 export function encodeMachineTransport(transport: MachineTransport): string {
@@ -63,4 +64,17 @@ export function encodeExternalChanges(activity: Activity): string {
   return JSON.stringify(
     activity.changes.map(({ kind, key, previous, current }) => ({ kind, key, previous, current })),
   );
+}
+
+/** Rust serializes LinkProvenance with snake_case fields and kebab-case enum values. */
+export function encodeLinkProvenance(link: ExternalLink): string | null {
+  const provenance = link.provenance;
+  if (provenance === null) return null;
+  return JSON.stringify({
+    run_id: provenance.run_id,
+    action: provenance.action,
+    discovery: provenance.discovery,
+    ordinal: provenance.ordinal ?? null,
+    blocked_by: provenance.blocked_by ?? [],
+  });
 }

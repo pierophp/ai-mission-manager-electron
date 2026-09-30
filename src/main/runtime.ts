@@ -1,10 +1,13 @@
 import { decide } from "../domain/state-transition";
 import type { Event } from "../domain/events";
 import type { DomainState } from "../domain/model";
+import type { ExternalObject } from "../domain/types";
 import type { SqliteStore } from "./persistence/sqlite-store";
 
 export class Runtime {
   private state: DomainState;
+  private readonly externalSnapshotRequestGenerations = new Map<number, number>();
+  private readonly externalSnapshotAppliedGenerations = new Map<number, number>();
   constructor(
     private readonly store: SqliteStore,
     initialState = store.loadState(),
@@ -29,6 +32,65 @@ export class Runtime {
     this.state = nextState;
     this.ensureProjectWorkspaces();
     return this.snapshot();
+  }
+
+  beginExternalSnapshotRequest(externalObjectId: number): number {
+    const generation = (this.externalSnapshotRequestGenerations.get(externalObjectId) ?? 0) + 1;
+    this.externalSnapshotRequestGenerations.set(externalObjectId, generation);
+    return generation;
+  }
+
+  applyExternalSnapshot(
+    object: DomainState["external_objects"][number],
+    generation: number,
+    snapshot: import("../domain/types").ExternalSnapshotData,
+    operation: "poll" | "refresh",
+  ): DomainState {
+    const externalObjectId = object.id;
+    if (
+      !this.state.external_objects.some(
+        (current) => JSON.stringify(current) === JSON.stringify(object),
+      ) ||
+      !this.state.links.some((link) => link.external_object_id === externalObjectId)
+    )
+      throw new Error(
+        operation === "poll"
+          ? "The External Object changed while it was being polled; poll it again"
+          : `External Object ${externalObjectId} changed while it was being refreshed; refresh it again`,
+      );
+    const currentSnapshot = this.state.snapshots.find(
+      (entry) => entry.external_object_id === externalObjectId,
+    );
+    if (
+      (currentSnapshot !== undefined && snapshot.fetched_at < currentSnapshot.fetched_at) ||
+      (this.externalSnapshotAppliedGenerations.get(externalObjectId) ?? 0) >= generation
+    )
+      throw new Error(
+        operation === "poll"
+          ? `A newer snapshot for External Object ${externalObjectId} was already applied; poll it again`
+          : `A newer snapshot for External Object ${externalObjectId} was already applied; refresh it again`,
+      );
+    const state = this.dispatch({ type: "refresh_external_object", externalObjectId, snapshot });
+    this.externalSnapshotAppliedGenerations.set(externalObjectId, generation);
+    return state;
+  }
+
+  rememberProviderExecutable(
+    contextId: number,
+    provider: Exclude<ExternalObject["provider"], "generic">,
+    executable: string,
+  ): void {
+    const context = this.state.contexts.find((candidate) => candidate.id === contextId);
+    if (!context) throw new Error(`Context ${contextId} does not exist`);
+    const key =
+      provider === "github"
+        ? "gh_executable_path"
+        : provider === "atlassian"
+          ? "twg_executable_path"
+          : "az_executable_path";
+    if (context[key] === executable) return;
+    this.store.setContextProviderExecutable(contextId, provider, executable);
+    context[key] = executable;
   }
 
   ensureProjectWorkspaces(): void {

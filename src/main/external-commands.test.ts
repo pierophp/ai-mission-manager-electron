@@ -4,13 +4,21 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { Runtime } from "./runtime";
-import { openSqliteStore } from "./persistence/sqlite-store";
+import { newContextConfiguration, openSqliteStore } from "./persistence/sqlite-store";
 import { createExternalCommandHandlers, githubRepositoryName } from "./external-commands";
 import { homeView } from "../domain/projections";
 
 const dirs: string[] = [];
+let originalPath: string | undefined;
+let shouldRestorePath = false;
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  if (shouldRestorePath) {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    originalPath = undefined;
+    shouldRestorePath = false;
+  }
 });
 
 describe("External Object commands and persistence", () => {
@@ -113,6 +121,10 @@ describe("External Object commands and persistence", () => {
       kind: "issue",
       external_key: "issue:acme/app#7",
     });
+    expect(handlers.set_link_purpose({ linkId: 1, purpose: "to-spec" }).link.purpose).toBe(
+      "to-spec",
+    );
+    expect(handlers.set_link_purpose({ linkId: 1, purpose: "others" }).link.purpose).toBe("others");
     expect(linked.link.snapshot).toMatchObject({
       title: "Initial",
       state: "OPEN",
@@ -339,6 +351,281 @@ describe("External Object commands and persistence", () => {
     await expect(handlers.fetch_issue_document({ externalObjectId: 1 })).resolves.toMatchObject({
       subIssues: [expect.objectContaining({ number: 12, title: "Add auth flow" })],
     });
+    store.close();
+  });
+
+  it("applies only the newest poll observation and persists Link attention fields", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "external-poll-generation-"));
+    dirs.push(dir);
+    const gate = path.join(dir, "first-poll-started");
+    const cli = path.join(dir, "gh");
+    writeFileSync(
+      cli,
+      `#!/bin/sh\nif mkdir '${gate}' 2>/dev/null; then sleep 0.4; printf '%s' '{"number":7,"title":"Old response","state":"OPEN","author":{"login":"octocat"},"labels":[],"milestone":null,"createdAt":null,"updatedAt":null}'; else printf '%s' '{"number":7,"title":"Newest response","state":"CLOSED","author":{"login":"octocat"},"labels":[],"milestone":null,"createdAt":null,"updatedAt":null}'; fi\n`,
+    );
+    chmodSync(cli, 0o755);
+    const dbPath = path.join(dir, "mission-manager.sqlite");
+    const store = openSqliteStore(dbPath);
+    const initial = store.loadState();
+    initial.contexts[0].gh_executable_path = cli;
+    const runtime = new Runtime(store, initial);
+    runtime.dispatch({
+      type: "create_item",
+      title: "Watch provider change",
+      contextId: 1,
+      projectId: 1,
+      notes: "",
+    });
+    runtime.dispatch({
+      type: "link_external_object",
+      itemId: 1,
+      object: {
+        provider: "github",
+        kind: "issue",
+        external_key: "issue:acme/app#7",
+        canonical_url: "https://github.com/acme/app/issues/7",
+      },
+      snapshot: { title: "Initial", state: "OPEN", metadata: [], fetched_at: 1 },
+    });
+    const handlers = createExternalCommandHandlers(runtime);
+    const firstPoll = handlers.poll_external_objects();
+    for (
+      let attempts = 0;
+      attempts < 100 && !(await import("node:fs").then(({ existsSync }) => existsSync(gate)));
+      attempts++
+    )
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    const secondPoll = handlers.poll_external_objects();
+    await expect(secondPoll).resolves.toMatchObject({ refreshed: 1, failures: [] });
+    await expect(firstPoll).resolves.toMatchObject({
+      refreshed: 0,
+      failures: [
+        {
+          external_object_id: 1,
+          error: "A newer snapshot for External Object 1 was already applied; poll it again",
+        },
+      ],
+    });
+    expect(runtime.snapshot().snapshots[0].title).toBe("Newest response");
+
+    const link = runtime.snapshot().links[0];
+    const reviewed = await handlers.set_link_attention_policy({
+      linkId: link.id,
+      policy: { title: true, state: false, metadata: false },
+    });
+    expect(reviewed.attention_policy).toEqual({ title: true, state: false, metadata: false });
+    await handlers.set_link_watch_until({ linkId: link.id, watchUntil: "2026-09-30T10:00" });
+    await handlers.set_link_review_at({ linkId: link.id, reviewAt: "2026-10-01T10:00" });
+    const updated = runtime.snapshot().links[0];
+    updated.provenance = {
+      run_id: 9,
+      action: "to-tickets",
+      discovery: "structured-event",
+      ordinal: null,
+      blocked_by: ["#4"],
+    };
+    new Runtime(store, { ...runtime.snapshot(), links: [updated] }).dispatch({
+      type: "set_link_attention_policy",
+      linkId: link.id,
+      policy: { title: false, state: true, metadata: false },
+    });
+    const raw = new DatabaseSync(dbPath, { readOnly: true });
+    expect(
+      raw
+        .prepare(
+          "SELECT watch_until, review_at, provenance_json FROM link_attention_state WHERE link_id=1",
+        )
+        .get(),
+    ).toEqual({
+      watch_until: "2026-09-30T10:00",
+      review_at: "2026-10-01T10:00",
+      provenance_json:
+        '{"run_id":9,"action":"to-tickets","discovery":"structured-event","ordinal":null,"blocked_by":["#4"]}',
+    });
+    raw.close();
+    store.close();
+  });
+
+  it("keeps attention independent for each Link to the same External Object", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "external-link-attention-"));
+    dirs.push(dir);
+    const store = openSqliteStore(path.join(dir, "mission-manager.sqlite"));
+    const runtime = new Runtime(store);
+    for (const title of ["First commitment", "Second commitment"])
+      runtime.dispatch({ type: "create_item", title, contextId: 1, projectId: 1, notes: "" });
+    const object = {
+      provider: "generic" as const,
+      kind: "generic" as const,
+      external_key: "shared-object",
+      canonical_url: "https://example.com/shared-object",
+    };
+    for (const itemId of [1, 2])
+      runtime.dispatch({
+        type: "link_external_object",
+        itemId,
+        object,
+        snapshot: { title: "Initial", state: "open", metadata: [], fetched_at: 1 },
+      });
+    runtime.dispatch({
+      type: "refresh_external_object",
+      externalObjectId: 1,
+      snapshot: { title: "Updated", state: "open", metadata: [], fetched_at: 2 },
+    });
+    const handlers = createExternalCommandHandlers(runtime);
+    expect(homeView(runtime.snapshot(), 1, "9999-12-31T23:59:59Z").attention_entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "external_change", link_id: 1 }),
+        expect.objectContaining({ kind: "external_change", link_id: 2 }),
+      ]),
+    );
+    await handlers.mark_link_reviewed({ linkId: 1 });
+    expect(homeView(runtime.snapshot(), 1, "9999-12-31T23:59:59Z").attention_entries).toEqual([
+      expect.objectContaining({ kind: "external_change", link_id: 2, item_id: 2 }),
+    ]);
+    store.close();
+  });
+
+  it("polls each linked Context with its provider configuration and skips local objects", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "external-context-poll-"));
+    dirs.push(dir);
+    const firstCli = path.join(dir, "twg-first");
+    const secondCli = path.join(dir, "az-second");
+    const thirdCli = path.join(dir, "twg");
+    const firstLog = path.join(dir, "first.log");
+    const secondLog = path.join(dir, "second.log");
+    const thirdLog = path.join(dir, "third.log");
+    for (const [executable, script] of [
+      [
+        firstCli,
+        `#!/bin/sh\nprintf '%s\\n' "$*" > '${firstLog}'\nprintf '%s' '{"title":"Jira title","status":"In Progress"}'\n`,
+      ],
+      [
+        secondCli,
+        `#!/bin/sh\nprintf '%s\\n' "$*" > '${secondLog}'\nprintf '%s' '{"fields":{"System.Title":"ADO title","System.State":"Active"}}'\n`,
+      ],
+      [
+        thirdCli,
+        `#!/bin/sh\nprintf '%s\\n' "$*" > '${thirdLog}'\nprintf '%s' 'isolated Context failure' >&2\nexit 1\n`,
+      ],
+    ] as const) {
+      writeFileSync(executable, script);
+      chmodSync(executable, 0o755);
+    }
+
+    const store = openSqliteStore(path.join(dir, "mission-manager.sqlite"));
+    const runtime = new Runtime(store);
+    runtime.dispatch({ type: "create_context", name: "Second Context" });
+    runtime.dispatch({ type: "create_context", name: "Third Context" });
+    const contextConfig = newContextConfiguration();
+    contextConfig.name = "Personal";
+    contextConfig.attentionDefaults = contextConfig.attentionDefaults.filter(
+      ({ object_kind }) => object_kind !== "document",
+    );
+    contextConfig.attentionDefaults.forEach((entry) => (entry.context_id = 1));
+    contextConfig.twgExecutablePath = firstCli;
+    contextConfig.atlassianSite = "first.atlassian.net";
+    runtime.dispatch({
+      type: "update_context_configuration",
+      contextId: 1,
+      configuration: contextConfig,
+    });
+    const secondConfig = newContextConfiguration();
+    secondConfig.name = "Second Context";
+    secondConfig.attentionDefaults = secondConfig.attentionDefaults.filter(
+      ({ object_kind }) => object_kind !== "document",
+    );
+    secondConfig.attentionDefaults.forEach((entry) => (entry.context_id = 2));
+    secondConfig.azExecutablePath = secondCli;
+    secondConfig.azureDevopsOrganization = "https://dev.azure.com/second-org";
+    runtime.dispatch({
+      type: "update_context_configuration",
+      contextId: 2,
+      configuration: secondConfig,
+    });
+    const thirdConfig = newContextConfiguration();
+    thirdConfig.name = "Third Context";
+    thirdConfig.attentionDefaults = thirdConfig.attentionDefaults.filter(
+      ({ object_kind }) => object_kind !== "document",
+    );
+    thirdConfig.attentionDefaults.forEach((entry) => (entry.context_id = 3));
+    originalPath = process.env.PATH;
+    shouldRestorePath = true;
+    process.env.PATH = `${dir}${path.delimiter}${process.env.PATH ?? ""}`;
+    thirdConfig.twgExecutablePath = null;
+    thirdConfig.atlassianSite = "third.atlassian.net";
+    runtime.dispatch({
+      type: "update_context_configuration",
+      contextId: 3,
+      configuration: thirdConfig,
+    });
+    for (const [title, contextId, projectId] of [
+      ["First Jira", 1, 1],
+      ["Azure work item", 2, 2],
+      ["Failing Jira", 3, 3],
+    ] as const)
+      runtime.dispatch({ type: "create_item", title, contextId, projectId, notes: "" });
+    const inputs = [
+      {
+        itemId: 1,
+        object: {
+          provider: "atlassian" as const,
+          kind: "issue" as const,
+          external_key: "jira:PROJ#PROJ-7",
+          canonical_url: "https://first.atlassian.net/browse/PROJ-7",
+        },
+      },
+      {
+        itemId: 2,
+        object: {
+          provider: "azure_dev_ops" as const,
+          kind: "issue" as const,
+          external_key: "ado:second-org/project#12",
+          canonical_url: "https://dev.azure.com/second-org/project/_workitems/edit/12",
+        },
+      },
+      {
+        itemId: 3,
+        object: {
+          provider: "atlassian" as const,
+          kind: "issue" as const,
+          external_key: "jira:FAIL#FAIL-5",
+          canonical_url: "https://third.atlassian.net/browse/FAIL-5",
+        },
+      },
+      {
+        itemId: 1,
+        object: {
+          provider: "generic" as const,
+          kind: "generic" as const,
+          external_key: "local:9#.scratch/spec.md",
+          canonical_url: "file:///repository/.scratch/spec.md",
+        },
+      },
+    ];
+    for (const { itemId, object } of inputs)
+      runtime.dispatch({ type: "link_external_object", itemId, object, snapshot: null });
+
+    const result = await createExternalCommandHandlers(runtime).poll_external_objects();
+    expect(result).toMatchObject({
+      refreshed: 2,
+      failures: [expect.objectContaining({ external_object_id: 3 })],
+    });
+    expect(result.failures[0].error).toContain("isolated Context failure");
+    const { readFile } = await import("node:fs/promises");
+    expect(await readFile(firstLog, "utf8")).toContain(
+      "jira workitem get PROJ-7 --site first.atlassian.net --output json",
+    );
+    expect(await readFile(secondLog, "utf8")).toContain(
+      "--organization https://dev.azure.com/second-org -o json",
+    );
+    expect(await readFile(thirdLog, "utf8")).toContain("jira workitem get FAIL-5");
+    expect(runtime.snapshot().contexts.find(({ id }) => id === 3)?.twg_executable_path).toBe(
+      thirdCli,
+    );
+    const snapshotTitles = runtime.snapshot().snapshots.map(({ title }) => title);
+    expect(snapshotTitles).toContain("Jira title");
+    expect(snapshotTitles).toContain("ADO title");
+    expect(snapshotTitles).not.toContain("Local Markdown");
     store.close();
   });
 });

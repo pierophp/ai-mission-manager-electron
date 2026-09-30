@@ -995,6 +995,94 @@ export function decide(state: DomainState, event: Event): Decision {
       effects.push({ type: "persist_external_snapshot", snapshot });
       break;
     }
+    case "set_link_purpose": {
+      const link = next.links.find((candidate) => candidate.id === event.linkId);
+      if (!link) throw new DomainError(`Link ${event.linkId} does not exist`);
+      const object = next.external_objects.find(
+        (candidate) => candidate.id === link.external_object_id,
+      );
+      if (!object)
+        throw new DomainError(`External Object ${link.external_object_id} does not exist`);
+      const isLocal = object.provider === "generic" && object.external_key.startsWith("local:");
+      const supportsSpec =
+        isLocal ||
+        (object.provider === "github" && object.kind === "issue") ||
+        (object.provider === "atlassian" && ["issue", "document"].includes(object.kind));
+      const supportsTicket =
+        isLocal ||
+        (object.provider === "github" && object.kind === "issue") ||
+        (object.provider === "atlassian" && object.kind === "issue");
+      if (event.purpose === "to-spec" && !supportsSpec)
+        throw new DomainError("This External Object cannot have the Spec Link purpose");
+      if (event.purpose === "to-tickets") {
+        if (!supportsTicket)
+          throw new DomainError("This External Object cannot have the Tickets Link purpose");
+        if (event.specExternalObjectId !== null) {
+          const specLink = next.links.find(
+            (candidate) =>
+              candidate.item_id === link.item_id &&
+              candidate.external_object_id === event.specExternalObjectId &&
+              candidate.external_object_id !== link.external_object_id &&
+              candidate.purpose === "to-spec",
+          );
+          const specObject = next.external_objects.find(
+            (candidate) =>
+              candidate.id === event.specExternalObjectId &&
+              ((candidate.provider === "generic" && candidate.external_key.startsWith("local:")) ||
+                (candidate.provider === "github" && candidate.kind === "issue") ||
+                (candidate.provider === "atlassian" && candidate.kind === "document")),
+          );
+          if (!specLink || !specObject)
+            throw new DomainError("A ticket must reference a supported Spec on the same Item");
+        }
+      }
+      const previousSpecId = link.external_object_id;
+      link.purpose = event.purpose;
+      link.spec_external_object_id =
+        event.purpose === "to-tickets" ? event.specExternalObjectId : null;
+      effects.push({ type: "persist_link_state", link: structuredClone(link) });
+      if (event.purpose !== "to-spec") {
+        for (const ticketLink of next.links) {
+          if (
+            ticketLink.item_id === link.item_id &&
+            ticketLink.purpose === "to-tickets" &&
+            ticketLink.spec_external_object_id === previousSpecId
+          ) {
+            ticketLink.spec_external_object_id = null;
+            effects.push({ type: "persist_link_state", link: structuredClone(ticketLink) });
+          }
+        }
+      }
+      break;
+    }
+    case "set_link_watch_until": {
+      const link = next.links.find((candidate) => candidate.id === event.linkId);
+      if (!link) throw new DomainError(`Link ${event.linkId} does not exist`);
+      link.watch_until = event.watchUntil;
+      effects.push({ type: "persist_link_state", link: structuredClone(link) });
+      break;
+    }
+    case "set_link_review_at": {
+      const link = next.links.find((candidate) => candidate.id === event.linkId);
+      if (!link) throw new DomainError(`Link ${event.linkId} does not exist`);
+      link.review_at = event.reviewAt;
+      effects.push({ type: "persist_link_state", link: structuredClone(link) });
+      break;
+    }
+    case "clear_link_review_at": {
+      const link = next.links.find((candidate) => candidate.id === event.linkId);
+      if (!link) throw new DomainError(`Link ${event.linkId} does not exist`);
+      link.review_at = null;
+      effects.push({ type: "persist_link_state", link: structuredClone(link) });
+      break;
+    }
+    case "set_link_attention_policy": {
+      const link = next.links.find((candidate) => candidate.id === event.linkId);
+      if (!link) throw new DomainError(`Link ${event.linkId} does not exist`);
+      link.attention_policy = event.policy;
+      effects.push({ type: "persist_link_state", link: structuredClone(link) });
+      break;
+    }
     case "mark_link_reviewed": {
       const link = next.links.find((candidate) => candidate.id === event.linkId);
       if (!link) throw new DomainError(`Link ${event.linkId} does not exist`);

@@ -19,6 +19,8 @@ import type {
   ExternalObjectInput,
   ExternalSnapshot,
   ExternalSnapshotData,
+  ExternalChangePolicy,
+  LinkPurpose,
 } from "./types";
 import type { DomainState } from "./model";
 
@@ -142,6 +144,16 @@ export type Event =
       snapshot: ExternalSnapshotData | null;
     }
   | { type: "refresh_external_object"; externalObjectId: number; snapshot: ExternalSnapshotData }
+  | {
+      type: "set_link_purpose";
+      linkId: number;
+      purpose: LinkPurpose;
+      specExternalObjectId: number | null;
+    }
+  | { type: "set_link_watch_until"; linkId: number; watchUntil: string | null }
+  | { type: "set_link_review_at"; linkId: number; reviewAt: string | null }
+  | { type: "clear_link_review_at"; linkId: number }
+  | { type: "set_link_attention_policy"; linkId: number; policy: ExternalChangePolicy | null }
   | { type: "mark_link_reviewed"; linkId: number };
 
 export type Effect =

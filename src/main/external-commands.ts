@@ -8,6 +8,9 @@ import type {
   ExternalLinkView,
   ExternalObject,
   ExternalSnapshot,
+  ExternalChangePolicy,
+  PollResult,
+  ExternalSnapshotData,
   SubIssue,
 } from "../domain/types";
 import type { Runtime } from "./runtime";
@@ -490,11 +493,159 @@ export function createExternalCommandHandlers(runtime: Runtime) {
         )
       ).body;
     },
+    set_link_attention_policy: (args: Record<string, unknown>): ExternalLinkView => {
+      const linkId = Number(args.linkId);
+      const policy = args.policy as ExternalChangePolicy | null;
+      const result = runtime.dispatch({ type: "set_link_attention_policy", linkId, policy });
+      return linkView(result, linkId);
+    },
+    set_link_purpose: (args: Record<string, unknown>): ExternalLinkView => {
+      const linkId = Number(args.linkId);
+      const purpose = args.purpose as "to-spec" | "to-tickets" | "others";
+      const result = runtime.dispatch({
+        type: "set_link_purpose",
+        linkId,
+        purpose,
+        specExternalObjectId:
+          args.specExternalObjectId == null ? null : Number(args.specExternalObjectId),
+      });
+      return linkView(result, linkId);
+    },
+    set_link_watch_until: (args: Record<string, unknown>): ExternalLinkView => {
+      const linkId = Number(args.linkId);
+      const result = runtime.dispatch({
+        type: "set_link_watch_until",
+        linkId,
+        watchUntil: args.watchUntil == null ? null : String(args.watchUntil),
+      });
+      return linkView(result, linkId);
+    },
+    set_link_review_at: (args: Record<string, unknown>): ExternalLinkView => {
+      const linkId = Number(args.linkId);
+      const result = runtime.dispatch({
+        type: "set_link_review_at",
+        linkId,
+        reviewAt: args.reviewAt == null ? null : String(args.reviewAt),
+      });
+      return linkView(result, linkId);
+    },
+    clear_link_review_at: (args: Record<string, unknown>): ExternalLinkView => {
+      const linkId = Number(args.linkId);
+      const result = runtime.dispatch({ type: "clear_link_review_at", linkId });
+      return linkView(result, linkId);
+    },
+    mark_link_reviewed: (args: Record<string, unknown>): ExternalLinkView => {
+      const linkId = Number(args.linkId);
+      const result = runtime.dispatch({ type: "mark_link_reviewed", linkId });
+      return linkView(result, linkId);
+    },
+    poll_external_objects: async (): Promise<PollResult> => {
+      const capturedState = runtime.snapshot();
+      const byId = new Map<number, (typeof capturedState.external_objects)[number]>();
+      for (const link of capturedState.links) {
+        const object = capturedState.external_objects.find(
+          (candidate) => candidate.id === link.external_object_id,
+        );
+        if (object && ["github", "atlassian", "azure_dev_ops"].includes(object.provider))
+          byId.set(object.id, object);
+      }
+      const entries: {
+        object: (typeof capturedState.external_objects)[number];
+        contextId: number;
+        config: ProviderConfig;
+        generation: number;
+      }[] = [];
+      const result: PollResult = { refreshed: 0, failures: [] };
+      for (const object of [...byId.values()].sort((a, b) => a.id - b.id)) {
+        try {
+          const { context } = contextForObject(capturedState, object.id);
+          entries.push({
+            object,
+            contextId: context.id,
+            config: providerConfig(capturedState, context.id),
+            generation: runtime.beginExternalSnapshotRequest(object.id),
+          });
+        } catch (error) {
+          result.failures.push({
+            external_object_id: object.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      entries.sort((a, b) => a.contextId - b.contextId || a.object.id - b.object.id);
+      const observations: {
+        object: (typeof capturedState.external_objects)[number];
+        contextId: number;
+        generation: number;
+        executable: string | null;
+        snapshot: ExternalSnapshotData | null;
+        error: string | null;
+      }[] = [];
+      for (const entry of entries) {
+        let executable: string | null = null;
+        try {
+          const dispatch = new ProviderDispatch(entry.config);
+          const provider = entry.object.provider as Exclude<ExternalObject["provider"], "generic">;
+          executable = await dispatch.resolveExecutable(provider);
+          const snapshot = await new ProviderDispatch({
+            ...entry.config,
+            ...(entry.object.provider === "github"
+              ? { ghPath: executable }
+              : entry.object.provider === "atlassian"
+                ? { twgPath: executable }
+                : { azPath: executable }),
+          }).fetchSnapshot(objectInput(entry.object), nowSeconds());
+          observations.push({
+            object: entry.object,
+            contextId: entry.contextId,
+            generation: entry.generation,
+            executable,
+            snapshot,
+            error: null,
+          });
+        } catch (error) {
+          observations.push({
+            object: entry.object,
+            contextId: entry.contextId,
+            generation: entry.generation,
+            executable,
+            snapshot: null,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      for (const observation of observations) {
+        try {
+          if (observation.executable !== null)
+            runtime.rememberProviderExecutable(
+              observation.contextId,
+              observation.object.provider as Exclude<ExternalObject["provider"], "generic">,
+              observation.executable,
+            );
+          if (observation.error !== null) throw new Error(observation.error);
+          if (observation.snapshot === null) throw new Error("Provider returned no snapshot");
+          runtime.applyExternalSnapshot(
+            observation.object,
+            observation.generation,
+            observation.snapshot,
+            "poll",
+          );
+          result.refreshed += 1;
+        } catch (error) {
+          result.failures.push({
+            external_object_id: observation.object.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      return result;
+    },
     refresh_external_object: async (args: Record<string, unknown>): Promise<ExternalSnapshot> => {
       const state = runtime.snapshot();
       const id = Number(args.externalObjectId);
       const object = state.external_objects.find((entry) => entry.id === id);
       if (!object) throw new Error(`External Object ${id} does not exist`);
+      const generation = runtime.beginExternalSnapshotRequest(id);
       const { context } = contextForObject(state, id);
       let snapshot;
       if (object.external_key.startsWith("local:")) {
@@ -505,13 +656,7 @@ export function createExternalCommandHandlers(runtime: Runtime) {
           objectInput(object),
           nowSeconds(),
         );
-      if (!runtime.snapshot().external_objects.some((entry) => entry.id === id))
-        throw new Error(`External Object ${id} does not exist`);
-      const result = runtime.dispatch({
-        type: "refresh_external_object",
-        externalObjectId: id,
-        snapshot,
-      });
+      const result = runtime.applyExternalSnapshot(object, generation, snapshot, "refresh");
       return result.snapshots.find((entry) => entry.external_object_id === id)!;
     },
   };
