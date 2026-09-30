@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { createCommandDispatcher, invokeEnvelope } from "../../shared/ipc";
 import { createReadCommandHandlers } from "./commands";
+import { createStructureCommandHandlers } from "../structure-commands";
 import { openSqliteStore } from "./sqlite-store";
 
 const temporaryDirectories: string[] = [];
@@ -18,7 +19,7 @@ afterEach(() => {
     rmSync(directory, { recursive: true, force: true });
 });
 
-describe("Rust-compatible read-only SQLite store", () => {
+describe("Rust-compatible SQLite store", () => {
   it("creates the Rust-openable Personal and Default seed using DELETE journaling", () => {
     const databasePath = temporaryDatabase();
     const store = openSqliteStore(databasePath);
@@ -134,7 +135,11 @@ describe("Rust-compatible read-only SQLite store", () => {
     };
     expect(manifest.fixtureVersion).toBe(1);
     expect(manifest.source).toContain("Rust persistence test");
-    expect(manifest.artifacts).toEqual(["rust-persistence.sqlite", "domain-state.json"]);
+    expect(manifest.artifacts).toEqual([
+      "rust-persistence.sqlite",
+      "domain-state.json",
+      "context-write-rust.json",
+    ]);
     expect(manifest.rustSource.commit).toMatch(/^[0-9a-f]{40}$/);
     expect(manifest.rustSource.fixtureGenerator).toContain("persistence/tests.rs");
     expect(manifest.typescriptDatabaseOpenValidation.result).toContain("passed");
@@ -174,5 +179,206 @@ describe("Rust-compatible read-only SQLite store", () => {
     expect(() => openSqliteStore(databasePath)).toThrow(
       "database schema is incompatible; remove the database and start again",
     );
+  });
+});
+
+describe("Context write transactions", () => {
+  it("persists Context, Default Project, configuration, metadata, and Rust-shaped audit JSON", async () => {
+    const { Runtime } = await import("../runtime");
+    const store = openSqliteStore(temporaryDatabase());
+    const runtime = new Runtime(store);
+    const before = runtime.snapshot();
+    const context = runtime.dispatch({ type: "create_context", name: "Research" }).contexts.at(-1)!;
+    expect(context.id).toBe(before.next_context_id);
+    expect(runtime.snapshot().projects.at(-1)).toMatchObject({
+      context_id: context.id,
+      name: "Default",
+    });
+    const database = new DatabaseSync(store.path, { readOnly: true });
+    expect(
+      database
+        .prepare("SELECT id,name,check_dirty_checkouts FROM contexts WHERE id=?")
+        .get(context.id),
+    ).toEqual({ id: context.id, name: "Research", check_dirty_checkouts: 1 });
+    expect(
+      database.prepare("SELECT value FROM metadata WHERE key='next_context_id'").get(),
+    ).toEqual({ value: context.id + 1 });
+    expect(
+      database.prepare("SELECT action_json FROM audit_entries ORDER BY id DESC LIMIT 1").get(),
+    ).toEqual({ action_json: `{"action":"contextCreated","context_id":${context.id}}` });
+    database.close();
+    store.close();
+  });
+
+  it("matches the Rust-generated Context write compatibility fixture byte for byte", async () => {
+    const { Runtime } = await import("../runtime");
+    const { newContextConfiguration } = await import("./sqlite-store");
+    const store = openSqliteStore(temporaryDatabase());
+    const seed = new DatabaseSync(store.path);
+    seed.exec("PRAGMA foreign_keys=ON");
+    seed
+      .prepare(
+        "INSERT INTO machines(id,context_id,name,socket_name,transport_json,last_observed) VALUES(1,1,'Build','mission','{\"kind\":\"local\"}','unknown')",
+      )
+      .run();
+    seed
+      .prepare(
+        "INSERT INTO cli_configuration_profiles(id,machine_id,provider,name,directory,app_managed) VALUES(1,1,'claude','Claude','/profiles/claude',0),(2,1,'codex','Codex','/profiles/codex',0)",
+      )
+      .run();
+    seed.prepare("UPDATE metadata SET value=2 WHERE key='next_machine_id'").run();
+    seed.prepare("UPDATE metadata SET value=3 WHERE key='next_cli_profile_id'").run();
+    seed.close();
+    const runtime = new Runtime(store);
+    const configuration = newContextConfiguration();
+    configuration.name = "Research";
+    configuration.executionMachineId = 1;
+    configuration.claudeProfileId = 1;
+    configuration.codexProfileId = 2;
+    configuration.ghExecutablePath = "/tools/gh";
+    configuration.twgExecutablePath = "/tools/twg";
+    configuration.azExecutablePath = "/tools/az";
+    configuration.atlassianSite = "https://acme.atlassian.net";
+    configuration.azureDevopsOrganization = "acme-devops";
+    configuration.bitbucketWorkspace = "acme-bitbucket";
+    configuration.checkDirtyCheckouts = false;
+    const context = createStructureCommandHandlers(runtime).create_context_configuration({
+      configuration,
+    }) as import("../../domain/types").Context;
+    const fixture = JSON.parse(
+      readFileSync(
+        path.join(process.cwd(), "src/main/persistence/fixtures/context-write-rust.json"),
+        "utf8",
+      ),
+    ) as {
+      context: Record<string, unknown>;
+      project: Record<string, unknown>;
+      attention_defaults: Record<string, unknown>[];
+      audit_action_json: string;
+      metadata: Record<string, number>;
+    };
+    const database = new DatabaseSync(store.path, { readOnly: true });
+    const contextRow = database
+      .prepare(
+        "SELECT id,name,execution_machine_id,check_dirty_checkouts,grill_agent,grill_model,grill_effort,implement_agent,implement_model,implement_effort,default_workflow,pstack_agent,pstack_model,pstack_effort,pstack_roles_json,claude_profile_id,codex_profile_id,gh_executable_path,twg_executable_path,az_executable_path,atlassian_site,azure_devops_organization,bitbucket_workspace FROM contexts WHERE id=?",
+      )
+      .get(context.id);
+    const projectRow = database
+      .prepare(
+        "SELECT id,context_id,name,default_item_status,default_execution_mode FROM projects WHERE context_id=?",
+      )
+      .get(context.id);
+    const attentionRows = database
+      .prepare(
+        "SELECT object_kind,title_attention,state_attention,metadata_attention FROM context_attention_defaults WHERE context_id=? ORDER BY object_kind",
+      )
+      .all(context.id);
+    const auditRow = database
+      .prepare("SELECT action_json FROM audit_entries ORDER BY id DESC LIMIT 1")
+      .get() as { action_json: string };
+    const metadata = Object.fromEntries(
+      [
+        "next_context_id",
+        "next_project_id",
+        "next_audit_id",
+        "next_machine_id",
+        "next_cli_profile_id",
+      ].map((key) => [
+        key,
+        (database.prepare("SELECT value FROM metadata WHERE key=?").get(key) as { value: number })
+          .value,
+      ]),
+    );
+    expect(contextRow).toEqual(fixture.context);
+    expect(projectRow).toEqual(fixture.project);
+    expect(attentionRows).toEqual(fixture.attention_defaults);
+    expect(auditRow.action_json).toBe(fixture.audit_action_json);
+    expect(metadata).toEqual(fixture.metadata);
+    database.close();
+    store.close();
+    const reopened = openSqliteStore(store.path);
+    expect(reopened.loadState().contexts.find((entry) => entry.id === context.id)).toMatchObject({
+      execution_machine_id: 1,
+      claude_profile_id: 1,
+      codex_profile_id: 2,
+      gh_executable_path: "/tools/gh",
+      twg_executable_path: "/tools/twg",
+      az_executable_path: "/tools/az",
+      atlassian_site: "https://acme.atlassian.net",
+      azure_devops_organization: "acme-devops",
+      bitbucket_workspace: "acme-bitbucket",
+    });
+    reopened.close();
+  });
+
+  it("round-trips dedicated Context defaults and preserves Document attention on a three-policy update", async () => {
+    const { Runtime } = await import("../runtime");
+    const { newContextConfiguration } = await import("./sqlite-store");
+    const store = openSqliteStore(temporaryDatabase());
+    const runtime = new Runtime(store);
+    runtime.dispatch({
+      type: "set_context_grill_defaults",
+      contextId: 1,
+      defaults: { agent: "claude", model: "claude-opus-5", effort: "medium" },
+    });
+    runtime.dispatch({
+      type: "set_context_implement_defaults",
+      contextId: 1,
+      defaults: { agent: "codex", model: "gpt-6-sol", effort: "high" },
+    });
+    for (const objectKind of ["issue", "pull_request", "generic"] as const)
+      runtime.dispatch({
+        type: "set_context_attention_default",
+        contextId: 1,
+        objectKind,
+        policy: { title: false, state: false, metadata: false },
+      });
+    runtime.dispatch({
+      type: "set_context_attention_default",
+      contextId: 1,
+      objectKind: "document",
+      policy: { title: true, state: false, metadata: true },
+    });
+    expect(store.loadState().contexts[0]).toMatchObject({
+      grill_defaults: { agent: "claude", model: "claude-opus-5", effort: "medium" },
+      implement_defaults: { agent: "codex", model: "gpt-6-sol", effort: "high" },
+    });
+    const configuration = newContextConfiguration();
+    configuration.name = "Personal";
+    configuration.attentionDefaults = configuration.attentionDefaults
+      .filter((entry) => entry.object_kind !== "document")
+      .map((entry) => ({ ...entry, context_id: 1 }));
+    runtime.dispatch({ type: "update_context_configuration", contextId: 1, configuration });
+    expect(store.loadState().attention_defaults).toContainEqual({
+      context_id: 1,
+      object_kind: "document",
+      policy: { title: true, state: false, metadata: true },
+    });
+    store.close();
+  });
+
+  it("keeps in-memory state and rolls back earlier effects if an effect fails", async () => {
+    const { Runtime } = await import("../runtime");
+    const store = openSqliteStore(temporaryDatabase());
+    const runtime = new Runtime(store);
+    const before = runtime.snapshot();
+    const database = new DatabaseSync(store.path);
+    database.exec(
+      "CREATE TRIGGER reject_project BEFORE INSERT ON projects WHEN NEW.name='Default' AND NEW.context_id=2 BEGIN SELECT RAISE(ABORT,'write rejected'); END",
+    );
+    database.close();
+    expect(() => runtime.dispatch({ type: "create_context", name: "Research" })).toThrow(
+      "write rejected",
+    );
+    expect(runtime.snapshot()).toEqual(before);
+    const verify = new DatabaseSync(store.path, { readOnly: true });
+    expect(
+      verify.prepare("SELECT COUNT(*) AS count FROM contexts WHERE name='Research'").get(),
+    ).toEqual({ count: 0 });
+    expect(verify.prepare("SELECT COUNT(*) AS count FROM audit_entries").get()).toEqual({
+      count: 0,
+    });
+    verify.close();
+    store.close();
   });
 });

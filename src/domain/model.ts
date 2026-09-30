@@ -13,8 +13,8 @@ import type {
   Repository,
   RepositoryLocation,
   Workspace,
-} from "../renderer/runtime/types";
-import type { Run } from "../renderer/runtime/execution-types";
+} from "./types";
+import type { Run } from "./execution-types";
 
 /** The persisted domain model loaded from the Rust-compatible SQLite store. */
 export type DomainState = {

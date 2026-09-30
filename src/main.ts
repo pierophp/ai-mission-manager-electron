@@ -4,6 +4,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { createCommandDispatcher, INVOKE_CHANNEL } from "./shared/ipc";
 import { createReadCommandHandlers } from "./main/persistence/commands";
+import { createStructureCommandHandlers } from "./main/structure-commands";
+import { Runtime } from "./main/runtime";
 import { openSqliteStore, type SqliteStore } from "./main/persistence/sqlite-store";
 import { ensureProjectWorkspaces, recoverRunStateRecords } from "./main/persistence/startup";
 
@@ -132,7 +134,13 @@ if (!hasSingleInstance) {
       const state = store.loadState();
       ensureProjectWorkspaces(state);
       recoverRunStateRecords(state);
-      registerIpc(createCommandDispatcher(createReadCommandHandlers(store)));
+      const runtime = new Runtime(store, state);
+      registerIpc(
+        createCommandDispatcher({
+          ...createReadCommandHandlers(store),
+          ...createStructureCommandHandlers(runtime),
+        }),
+      );
       mainWindow = createWindow();
     } catch (error) {
       dialog.showErrorBox(

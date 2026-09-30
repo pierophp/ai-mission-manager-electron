@@ -49,13 +49,12 @@ function createFreshDatabase(databasePath: string): void {
   database.close();
 }
 
-/** Opens existing user data without write access. Only a missing database is initialized. */
+/** Opens the current user database; only a missing database is initialized. */
 export function openSqliteDatabase(
   databasePath = path.join(homedir(), ".ai-mission-manager", "mission-manager.sqlite"),
 ) {
   if (!existsSync(databasePath)) createFreshDatabase(databasePath);
   const database = new DatabaseSync(databasePath, {
-    readOnly: true,
     enableForeignKeyConstraints: true,
     timeout: 1000,
   });
