@@ -908,6 +908,125 @@ export function decide(state: DomainState, event: Event): Decision {
       effects.push({ type: "persist_workspace_update", workspace: structuredClone(workspace) });
       break;
     }
+    case "link_external_object": {
+      const item = next.items.find((candidate) => candidate.id === event.itemId);
+      if (!item) throw new DomainError(`Item ${event.itemId} does not exist`);
+      if (!event.object.canonical_url.trim())
+        throw new DomainError("an external URL cannot be blank");
+      if (!event.object.external_key.trim())
+        throw new DomainError("an external object key cannot be blank");
+      const existing = next.external_objects.find(
+        (candidate) =>
+          candidate.provider === event.object.provider &&
+          candidate.external_key === event.object.external_key,
+      );
+      const object = existing ?? {
+        ...event.object,
+        canonical_url: event.object.canonical_url.trim(),
+        id: next.next_external_object_id,
+      };
+      if (!existing) {
+        next.next_external_object_id += 1;
+        next.external_objects.push(object);
+        effects.push({
+          type: "persist_external_object",
+          object,
+          nextExternalObjectId: next.next_external_object_id,
+        });
+      }
+      if (
+        next.links.some((link) => link.item_id === item.id && link.external_object_id === object.id)
+      )
+        throw new DomainError("the Link already exists");
+      const link = {
+        id: next.next_link_id++,
+        item_id: item.id,
+        external_object_id: object.id,
+        reviewed_activity_id: next.activities
+          .filter((activity) => activity.external_object_id === object.id)
+          .reduce((id, activity) => Math.max(id, activity.id), 0),
+        attention_policy: null,
+        watch_until: null,
+        review_at: null,
+        purpose: "others" as const,
+        spec_external_object_id: null,
+        provenance: null,
+      };
+      next.links.push(link);
+      effects.push({
+        type: "persist_external_link",
+        link: structuredClone(link),
+        nextLinkId: next.next_link_id,
+      });
+      if (event.snapshot) {
+        const snapshot = { external_object_id: object.id, ...event.snapshot };
+        const index = next.snapshots.findIndex((entry) => entry.external_object_id === object.id);
+        if (index < 0 || JSON.stringify(next.snapshots[index]) !== JSON.stringify(snapshot)) {
+          if (index < 0) next.snapshots.push(snapshot);
+          else next.snapshots[index] = snapshot;
+          effects.push({ type: "persist_external_snapshot", snapshot });
+        }
+      }
+      break;
+    }
+    case "refresh_external_object": {
+      if (!next.external_objects.some((object) => object.id === event.externalObjectId))
+        throw new DomainError(`External Object ${event.externalObjectId} does not exist`);
+      const snapshot = { external_object_id: event.externalObjectId, ...event.snapshot };
+      const previous = next.snapshots.find(
+        (entry) => entry.external_object_id === event.externalObjectId,
+      );
+      const changes = previous ? snapshotChanges(previous, snapshot) : [];
+      if (changes.length) {
+        const activity = {
+          id: next.next_activity_id++,
+          external_object_id: event.externalObjectId,
+          observed_at: snapshot.fetched_at,
+          changes,
+        };
+        next.activities.push(activity);
+        effects.push({ type: "persist_activity", activity, nextActivityId: next.next_activity_id });
+      }
+      const index = next.snapshots.findIndex(
+        (entry) => entry.external_object_id === event.externalObjectId,
+      );
+      if (index < 0) next.snapshots.push(snapshot);
+      else next.snapshots[index] = snapshot;
+      effects.push({ type: "persist_external_snapshot", snapshot });
+      break;
+    }
+    case "mark_link_reviewed": {
+      const link = next.links.find((candidate) => candidate.id === event.linkId);
+      if (!link) throw new DomainError(`Link ${event.linkId} does not exist`);
+      link.reviewed_activity_id = next.activities
+        .filter((activity) => activity.external_object_id === link.external_object_id)
+        .reduce((id, activity) => Math.max(id, activity.id), link.reviewed_activity_id);
+      effects.push({ type: "persist_link_state", link: structuredClone(link) });
+      break;
+    }
   }
   return { state: next, effects };
+}
+
+function snapshotChanges(
+  previous: import("./types").ExternalSnapshot,
+  current: import("./types").ExternalSnapshot,
+): import("./types").ExternalChange[] {
+  const changes: import("./types").ExternalChange[] = [];
+  if (previous.title !== current.title)
+    changes.push({ kind: "title", key: null, previous: previous.title, current: current.title });
+  if (previous.state !== current.state)
+    changes.push({ kind: "state", key: null, previous: previous.state, current: current.state });
+  const keys = [
+    ...new Set([
+      ...previous.metadata.map((entry) => entry.key),
+      ...current.metadata.map((entry) => entry.key),
+    ]),
+  ].sort();
+  for (const key of keys) {
+    const before = previous.metadata.find((entry) => entry.key === key)?.value ?? null;
+    const after = current.metadata.find((entry) => entry.key === key)?.value ?? null;
+    if (before !== after) changes.push({ kind: "metadata", key, previous: before, current: after });
+  }
+  return changes;
 }

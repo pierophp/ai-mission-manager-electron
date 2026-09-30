@@ -15,6 +15,10 @@ import type {
   ItemStatus,
   Item,
   ItemRelation,
+  ExternalObject,
+  ExternalObjectInput,
+  ExternalSnapshot,
+  ExternalSnapshotData,
 } from "./types";
 import type { DomainState } from "./model";
 
@@ -130,7 +134,15 @@ export type Event =
       baseBranch: string;
       isDirty: boolean;
     }
-  | { type: "mark_workspace_resumable"; workspaceId: number };
+  | { type: "mark_workspace_resumable"; workspaceId: number }
+  | {
+      type: "link_external_object";
+      itemId: number;
+      object: ExternalObjectInput;
+      snapshot: ExternalSnapshotData | null;
+    }
+  | { type: "refresh_external_object"; externalObjectId: number; snapshot: ExternalSnapshotData }
+  | { type: "mark_link_reviewed"; linkId: number };
 
 export type Effect =
   | { type: "persist_context"; context: Context; nextContextId: number }
@@ -176,6 +188,11 @@ export type Effect =
   | { type: "persist_item"; item: Item; nextItemId: number; nextItemNumber: number }
   | { type: "persist_item_update"; item: Item }
   | { type: "persist_item_reminders"; item: Item; nextReminderId: number }
-  | { type: "persist_item_relation"; relation: ItemRelation };
+  | { type: "persist_item_relation"; relation: ItemRelation }
+  | { type: "persist_external_object"; object: ExternalObject; nextExternalObjectId: number }
+  | { type: "persist_external_link"; link: DomainState["links"][number]; nextLinkId: number }
+  | { type: "persist_link_state"; link: DomainState["links"][number] }
+  | { type: "persist_external_snapshot"; snapshot: ExternalSnapshot }
+  | { type: "persist_activity"; activity: import("./types").Activity; nextActivityId: number };
 
 export type Decision = { state: import("./model").DomainState; effects: Effect[] };

@@ -1,5 +1,12 @@
 import type { DomainState } from "./model";
-import type { AttentionEntry, HomeView, ItemView, WorkspaceRepository } from "./types";
+import type {
+  AttentionEntry,
+  ExternalLinkView,
+  ExternalChange,
+  HomeView,
+  ItemView,
+  WorkspaceRepository,
+} from "./types";
 import type { GrillContinuationAction, Run, RunProjection } from "./execution-types";
 
 function runIsActive(run: Run): boolean {
@@ -70,7 +77,7 @@ function runProjection(run: Run): RunProjection {
   };
 }
 
-export function itemViews(state: DomainState, contextId?: number | null): ItemView[] {
+export function itemViews(state: DomainState, contextId?: number | null, now?: string): ItemView[] {
   return state.items.flatMap((item) => {
     const project = state.projects.find((candidate) => candidate.id === item.project_id);
     if (!project || (contextId != null && project.context_id !== contextId)) return [];
@@ -129,10 +136,87 @@ export function itemViews(state: DomainState, contextId?: number | null): ItemVi
         implementation_queues: state.implementation_queues.filter(
           (queue) => queue.itemId === item.id,
         ),
-        links: [],
+        links: state.links
+          .filter((link) => link.item_id === item.id)
+          .flatMap((link) => {
+            const object = state.external_objects.find(
+              (candidate) => candidate.id === link.external_object_id,
+            );
+            if (!object) return [];
+            const snapshot =
+              state.snapshots.find((candidate) => candidate.external_object_id === object.id) ??
+              null;
+            const attentionPolicy = link.attention_policy ??
+              state.attention_defaults.find(
+                (entry) => entry.context_id === context.id && entry.object_kind === object.kind,
+              )?.policy ?? { title: true, state: true, metadata: true };
+            const watchActive =
+              now === undefined || link.watch_until === null || link.watch_until > now;
+            const activities = state.activities
+              .filter(
+                (activity) =>
+                  watchActive &&
+                  activity.external_object_id === object.id &&
+                  activity.id > link.reviewed_activity_id,
+              )
+              .map((activity) => ({
+                ...activity,
+                changes: activity.changes.filter((change) => attentionPolicy[change.kind]),
+              }))
+              .filter((activity) => activity.changes.length);
+            const attentionEntry = activities.length
+              ? {
+                  kind: "external_change" as const,
+                  link_id: link.id,
+                  reminder_id: null,
+                  run_id: null,
+                  queue_id: null,
+                  item_id: item.id,
+                  external_object_id: object.id,
+                  source_title: snapshot?.title ?? object.canonical_url,
+                  source_url: object.canonical_url,
+                  activities,
+                  summary: activities
+                    .flatMap((activity) => activity.changes.map(formatExternalChange))
+                    .join("; "),
+                }
+              : null;
+            const local = object.provider === "generic" && object.external_key.startsWith("local:");
+            const view: ExternalLinkView = {
+              link,
+              object,
+              snapshot,
+              attention_policy: attentionPolicy,
+              attention_entry: attentionEntry,
+              supports_implementation_spec:
+                local ||
+                (object.provider === "github" && object.kind === "issue") ||
+                (object.provider === "atlassian" &&
+                  (object.kind === "issue" || object.kind === "document")),
+              supports_implementation_ticket:
+                local ||
+                (object.provider === "github" && object.kind === "issue") ||
+                (object.provider === "atlassian" && object.kind === "issue"),
+            };
+            return [view];
+          }),
       },
     ];
   });
+}
+
+function formatExternalChange(change: ExternalChange): string {
+  const label =
+    change.kind === "title"
+      ? "Title"
+      : change.kind === "state"
+        ? "State"
+        : `Metadata ${change.key ?? "value"}`;
+  if (change.previous !== null && change.current !== null)
+    return `${label} changed from ${change.previous} to ${change.current}`;
+  if (change.current !== null) return `${label} added as ${change.current}`;
+  if (change.previous !== null) return `${label} removed (was ${change.previous})`;
+  return `${label} changed`;
 }
 
 export function homeView(
@@ -140,8 +224,28 @@ export function homeView(
   contextId: number | null | undefined,
   now: string,
 ): HomeView {
-  const views = itemViews(state, contextId);
+  const views = itemViews(state, contextId, now);
   const entries: AttentionEntry[] = [];
+  for (const view of views) {
+    const { item } = view;
+    for (const { link, object, snapshot, attention_entry: attentionEntry } of view.links) {
+      if (attentionEntry) entries.push(attentionEntry);
+      if (link.review_at !== null && link.review_at <= now)
+        entries.push({
+          kind: "review",
+          link_id: link.id,
+          reminder_id: null,
+          run_id: null,
+          queue_id: null,
+          item_id: item.id,
+          external_object_id: object.id,
+          source_title: snapshot?.title ?? object.canonical_url,
+          source_url: object.canonical_url,
+          activities: [],
+          summary: `Review scheduled for ${link.review_at}`,
+        });
+    }
+  }
   for (const { item } of views) {
     for (const reminder of item.reminders.filter((candidate) => candidate.remind_at <= now))
       entries.push({

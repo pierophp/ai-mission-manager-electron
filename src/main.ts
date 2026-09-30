@@ -7,6 +7,7 @@ import { createReadCommandHandlers } from "./main/persistence/commands";
 import { createStructureCommandHandlers } from "./main/structure-commands";
 import { createSetupCommandHandlers } from "./main/setup";
 import { createWorkCommandHandlers } from "./main/work-commands";
+import { createExternalCommandHandlers } from "./main/external-commands";
 import { Runtime } from "./main/runtime";
 import { openSqliteStore, type SqliteStore } from "./main/persistence/sqlite-store";
 import { ensureProjectWorkspaces, recoverRunStateRecords } from "./main/persistence/startup";
@@ -145,6 +146,7 @@ if (!hasSingleInstance) {
           ...createSetupCommandHandlers(runtime, store),
           ...createStructureCommandHandlers(runtime, machineAccess, store),
           ...createWorkCommandHandlers(runtime, machineAccess),
+          ...createExternalCommandHandlers(runtime),
         }),
       );
       mainWindow = createWindow();

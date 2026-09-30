@@ -36,6 +36,8 @@ import {
   encodeProjectCreatedAudit,
   encodePstackRoleTable,
   encodeRepositoryRegisteredAudit,
+  encodeExternalMetadata,
+  encodeExternalChanges,
 } from "./write-codecs";
 import { getSetupState, newContextConfiguration, readSetting } from "./settings";
 
@@ -369,6 +371,62 @@ export class SqliteStore {
         ).run(effect.relation.from_item_id, effect.relation.to_item_id, kind);
         break;
       }
+      case "persist_external_object":
+        db.prepare(
+          "INSERT INTO external_objects(id,provider,kind,external_key,canonical_url) VALUES(?,?,?,?,?)",
+        ).run(
+          effect.object.id,
+          effect.object.provider,
+          effect.object.kind,
+          effect.object.external_key,
+          effect.object.canonical_url,
+        );
+        db.prepare("UPDATE metadata SET value=? WHERE key='next_external_object_id'").run(
+          effect.nextExternalObjectId,
+        );
+        break;
+      case "persist_external_link": {
+        const link = effect.link;
+        db.prepare(
+          "INSERT INTO external_links(id,item_id,external_object_id,purpose,spec_external_object_id) VALUES(?,?,?,?,?)",
+        ).run(
+          link.id,
+          link.item_id,
+          link.external_object_id,
+          link.purpose,
+          link.spec_external_object_id,
+        );
+        this.persistLinkState(link);
+        db.prepare("UPDATE metadata SET value=? WHERE key='next_link_id'").run(effect.nextLinkId);
+        break;
+      }
+      case "persist_link_state":
+        this.persistLinkState(effect.link);
+        break;
+      case "persist_external_snapshot":
+        db.prepare(
+          "INSERT INTO external_snapshots(external_object_id,title,state,metadata_json,fetched_at) VALUES(?,?,?,?,?) ON CONFLICT(external_object_id) DO UPDATE SET title=excluded.title,state=excluded.state,metadata_json=excluded.metadata_json,fetched_at=excluded.fetched_at",
+        ).run(
+          effect.snapshot.external_object_id,
+          effect.snapshot.title,
+          effect.snapshot.state,
+          encodeExternalMetadata(effect.snapshot.metadata),
+          effect.snapshot.fetched_at,
+        );
+        break;
+      case "persist_activity":
+        db.prepare(
+          "INSERT INTO activities(id,external_object_id,observed_at,changes_json) VALUES(?,?,?,?)",
+        ).run(
+          effect.activity.id,
+          effect.activity.external_object_id,
+          effect.activity.observed_at,
+          encodeExternalChanges(effect.activity),
+        );
+        db.prepare("UPDATE metadata SET value=? WHERE key='next_activity_id'").run(
+          effect.nextActivityId,
+        );
+        break;
       case "update_context":
         persist(effect.context);
         break;
@@ -417,6 +475,25 @@ export class SqliteStore {
         break;
       }
     }
+  }
+  private persistLinkState(link: DomainState["links"][number]): void {
+    this.database
+      .prepare(
+        "INSERT INTO link_attention_state(link_id,reviewed_activity_id,title_attention,state_attention,metadata_attention,watch_until,review_at,provenance_json) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(link_id) DO UPDATE SET reviewed_activity_id=excluded.reviewed_activity_id,title_attention=excluded.title_attention,state_attention=excluded.state_attention,metadata_attention=excluded.metadata_attention,watch_until=excluded.watch_until,review_at=excluded.review_at,provenance_json=excluded.provenance_json",
+      )
+      .run(
+        link.id,
+        link.reviewed_activity_id,
+        link.attention_policy === null ? null : Number(link.attention_policy.title),
+        link.attention_policy === null ? null : Number(link.attention_policy.state),
+        link.attention_policy === null ? null : Number(link.attention_policy.metadata),
+        link.watch_until,
+        link.review_at,
+        link.provenance === null ? null : JSON.stringify(link.provenance),
+      );
+    this.database
+      .prepare("UPDATE external_links SET purpose=?,spec_external_object_id=? WHERE id=?")
+      .run(link.purpose, link.spec_external_object_id, link.id);
   }
   private persistWorkspaceRepositories(workspace: DomainState["workspaces"][number]): void {
     this.database

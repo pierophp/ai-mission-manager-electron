@@ -362,6 +362,8 @@ export type ExternalObject = {
   canonical_url: string;
 };
 
+export type ExternalObjectInput = Omit<ExternalObject, "id">;
+
 export type ExternalObjectKind = ExternalObject["kind"];
 
 export type ExternalMetadata = {
@@ -376,6 +378,8 @@ export type ExternalSnapshot = {
   metadata: ExternalMetadata[];
   fetched_at: number;
 };
+
+export type ExternalSnapshotData = Omit<ExternalSnapshot, "external_object_id">;
 
 /** An external work item or Confluence page read as a document. */
 export type IssueDocument = {

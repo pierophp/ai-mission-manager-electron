@@ -4,6 +4,7 @@ import type {
   Context,
   ContextAttentionDefault,
   ExternalObject,
+  ExternalLink,
   ExternalSnapshot,
   ImplementationQueue,
   Item,
@@ -56,18 +57,7 @@ export type DomainState = {
   implementation_queues: ImplementationQueue[];
   relationships: ItemRelation[];
   external_objects: ExternalObject[];
-  links: {
-    id: number;
-    item_id: number;
-    external_object_id: number;
-    reviewed_activity_id: number;
-    attention_policy: { title: boolean; state: boolean; metadata: boolean } | null;
-    watch_until: string | null;
-    review_at: string | null;
-    purpose: "to-spec" | "to-tickets" | "others";
-    spec_external_object_id: number | null;
-    provenance: Record<string, unknown> | null;
-  }[];
+  links: ExternalLink[];
   snapshots: ExternalSnapshot[];
   activities: Activity[];
   attention_defaults: ContextAttentionDefault[];
