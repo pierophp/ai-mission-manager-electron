@@ -1,0 +1,515 @@
+import {
+  type Dispatch,
+  type SetStateAction,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { cn } from "cn";
+import { Button } from "../../../components/ui/button";
+import { Card, CardContent } from "../../../components/ui/card";
+import { Spinner } from "../../../components/ui/spinner";
+import { errorMessage } from "../../../runtime/errors";
+import type { GrillContinuationAction } from "../../../runtime/execution-types";
+import type { PaneTab } from "../../../runtime/terminal-types";
+import type {
+  GrillAgentCatalog,
+  GrillAnswer,
+  ItemView,
+  Machine,
+  Repository,
+  Run,
+} from "../../../runtime/types";
+import { GrillQuestionFlow } from "../grill-questions";
+import {
+  type ItemForm,
+  type ItemIntent,
+  grillQuestionKey,
+  runPhaseLabel,
+} from "../item-signals";
+import type { ItemCommands } from "../use-item-commands";
+import { workActions } from "../work-commands";
+import { paneTabForRun, repositoryName } from "../work-utils";
+import { RunLaunchForm } from "./RunLaunchForm";
+import { useFormIntent } from "./shared";
+
+/** Unsent Grill answers, keyed by question round, kept across Item switches. */
+export type GrillAnswerDrafts = Record<string, Record<number, string>>;
+
+const runForms = ["run"] as const;
+
+export function RunsTab({
+  view,
+  repositories,
+  machines,
+  grillModelCatalog,
+  commands,
+  intent,
+  grillDrafts,
+  onGrillDraftsChange,
+  onOpenTerminal,
+  focusedRunRequest,
+}: {
+  view: ItemView;
+  repositories: Repository[];
+  machines: Machine[];
+  grillModelCatalog: GrillAgentCatalog[];
+  commands: ItemCommands;
+  intent: ItemIntent | undefined;
+  grillDrafts: GrillAnswerDrafts;
+  onGrillDraftsChange: Dispatch<SetStateAction<GrillAnswerDrafts>>;
+  onOpenTerminal: (runId: number, pane: PaneTab) => void;
+  focusedRunRequest?: { runId: number; request: number };
+}) {
+  const { isSaving, saveItem, confirm } = commands;
+  const [runForm, setRunForm] = useState<"run">();
+  const grillSubmissionLocks = useRef(new Set<string>());
+
+  useEffect(() => {
+    if (!focusedRunRequest) return;
+    const runCard = document.getElementById(
+      `run-card-${focusedRunRequest.runId}`,
+    );
+    runCard?.scrollIntoView({ behavior: "smooth", block: "center" });
+    runCard?.focus({ preventScroll: true });
+  }, [focusedRunRequest]);
+
+  const runsNewestFirst = [...view.runs].sort(
+    (left, right) => right.started_at - left.started_at || right.id - left.id,
+  );
+  function openRunForm(form: ItemForm) {
+    if (form === "run") openRun();
+  }
+
+  useFormIntent(intent, runForms, openRunForm);
+
+  function closeRunForm() {
+    setRunForm(undefined);
+  }
+
+  function openRun() {
+    setRunForm("run");
+  }
+
+  async function handleSubmitGrillAnswers(
+    run: Run,
+    submissionKey: string,
+    answers: GrillAnswer[],
+  ) {
+    if (grillSubmissionLocks.current.has(submissionKey)) return;
+    grillSubmissionLocks.current.add(submissionKey);
+    const submitted = await saveItem(
+      workActions.submitGrillAnswers(run.id, answers),
+    );
+    if (!submitted) {
+      grillSubmissionLocks.current.delete(submissionKey);
+      return;
+    }
+    onGrillDraftsChange((current) => {
+      const next = { ...current };
+      delete next[submissionKey];
+      return next;
+    });
+  }
+
+  async function handleContinueGrill(
+    run: Run,
+    action: GrillContinuationAction,
+  ) {
+    await saveItem(workActions.continueGrill(run.id, action));
+  }
+
+  async function handleGoPlan(run: Run) {
+    await saveItem(workActions.goPlan(run.id));
+  }
+
+  function handleStopRun(run: Run) {
+    confirm({
+      title: `Stop Run #${run.id}?`,
+      description:
+        "This is separate from completing the Item and will leave the Run in its history.",
+      confirmLabel: "Stop Run",
+      onConfirm: () => void saveItem(workActions.stopRun(run.id)),
+    });
+  }
+
+  function handleFinishRun(run: Run) {
+    confirm({
+      title: `Finish Run #${run.id}?`,
+      description:
+        "This records an explicit Run completion, keeps its transcript and answers in history, and leaves the Item status unchanged.",
+      confirmLabel: "Finish Run",
+      onConfirm: () => void saveItem(workActions.finishRun(run.id)),
+    });
+  }
+
+  function handleDeleteRun(run: Run) {
+    const projection = view.run_projections.find(
+      (candidate) => candidate.runId === run.id,
+    );
+    if (!projection?.continuations.delete) return;
+    confirm({
+      title: `Delete finished Run #${run.id}?`,
+      description: "This removes the Run from history and cannot be undone.",
+      confirmLabel: "Delete Run",
+      onConfirm: () => void saveItem(workActions.deleteRun(run.id)),
+    });
+  }
+
+  const launchWorkspace = view.workspaces[0];
+  if (runForm === "run" && launchWorkspace) {
+    return (
+      <RunLaunchForm
+        view={view}
+        modelCatalog={grillModelCatalog}
+        commands={commands}
+        target={{ kind: "checkout", workspace: launchWorkspace }}
+        onClose={closeRunForm}
+      />
+    );
+  }
+
+  return (
+    <div className="grid gap-4">
+      <div className="flex flex-wrap gap-2">
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={isSaving || !view.workspaces[0]}
+          onClick={() => {
+            openRun();
+          }}
+        >
+          Start Run
+        </Button>
+      </div>
+      {view.runs.length === 0 && (
+        <span className="text-sm text-muted-foreground">No Runs yet.</span>
+      )}
+      {runsNewestFirst.map((run) => {
+        const projection = view.run_projections.find(
+          (candidate) => candidate.runId === run.id,
+        )!;
+        const runRepository =
+          run.repository_id === null
+            ? run.direct_checkouts.find(
+                (checkout) => checkout.path === run.working_directory,
+              )?.repositoryId
+            : run.repository_id;
+        const runWorktree =
+          run.worktree_id === null
+            ? view.worktrees.find(
+                (worktree) => worktree.path === run.working_directory,
+              )
+            : view.worktrees.find(
+                (worktree) => worktree.id === run.worktree_id,
+              );
+        const questionKey = grillQuestionKey(run);
+        const persistedAnswers = Object.fromEntries(
+          run.grill_answers.map((answer) => [
+            answer.questionNumber,
+            answer.answer,
+          ]),
+        );
+        const answers = grillDrafts[questionKey] ?? persistedAnswers;
+        const nextActions = projection.continuations.grillActions;
+        return (
+          <Card
+            size="sm"
+            id={`run-card-${run.id}`}
+            tabIndex={-1}
+            className={cn(
+              "bg-muted/20",
+              focusedRunRequest?.runId === run.id && "ring-2 ring-primary",
+            )}
+            key={run.id}
+          >
+            <CardContent className="grid gap-2 pt-4">
+              <div>
+                <strong className="block text-sm">
+                  Run #{run.id} ·{" "}
+                  {run.agent === "claude" ? "Claude Code" : "Codex"}
+                  {run.cli_configuration_profile &&
+                    ` · ${run.cli_configuration_profile.name}`}
+                </strong>
+                <span className="text-xs text-muted-foreground">
+                  {run.execution_profile} ·{" "}
+                  {run.model && run.effort
+                    ? `${run.model} · ${run.effort} · `
+                    : ""}
+                  {machines.find((machine) => machine.id === run.machine_id)
+                    ?.name ?? "Machine #" + run.machine_id}{" "}
+                  ·{" "}
+                  {runPhaseLabel(projection.phase)}
+                  {run.pane_status === "available" && " · Pane available"}
+                </span>
+              </div>
+              <code className="break-all font-mono text-xs">
+                {run.working_directory}
+              </code>
+              <span className="text-xs text-muted-foreground">
+                {runRepository !== undefined
+                  ? `Repository ${repositoryName(repositories, runRepository)}`
+                  : ""}
+                {runWorktree
+                  ? " · Worktree"
+                  : runRepository !== undefined
+                    ? " · Direct checkout"
+                    : "Unregistered working location"}
+              </span>
+              <span className="text-xs text-muted-foreground">
+                Session {run.session_name} · Pane {run.pane_id}
+              </span>
+              {run.reported_pull_requests.length > 0 && (
+                <div className="grid gap-1 text-xs">
+                  <strong>Pull Requests reported by this Run</strong>
+                  {run.reported_pull_requests.map((url) => (
+                    <a
+                      className="break-all text-primary underline"
+                      href={url}
+                      key={url}
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      {url}
+                    </a>
+                  ))}
+                </div>
+              )}
+              {run.attention_summary && (
+                <div className="grid gap-1 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-sm">
+                  <strong>Attention</strong>
+                  <p className="whitespace-pre-wrap">{run.attention_summary}</p>
+                </div>
+              )}
+              {projection.continuations.goPlan && (
+                <section className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-primary/30 bg-primary/5 p-3" aria-label={`Plan ready for Run #${run.id}`}>
+                  <div className="grid gap-1 text-sm">
+                    <strong>Plan ready</strong>
+                    <PlanLink
+                      run={run}
+                      machine={machines.find((machine) => machine.id === run.machine_id)}
+                    />
+                  </div>
+                  <Button type="button" size="sm" disabled={isSaving || run.pane_status !== "available"} onClick={() => void handleGoPlan(run)}>Go</Button>
+                </section>
+              )}
+              {(projection.phase === "grillStarting" ||
+                projection.phase === "grillWorking") && (
+                  <div
+                    className="flex items-center gap-2 text-sm text-muted-foreground"
+                    aria-live="polite"
+                  >
+                    <Spinner />
+                    {projection.phase === "grillStarting"
+                      ? "Waiting for the Grill’s first questions…"
+                      : "The Grill is working…"}
+                  </div>
+                )}
+              {projection.phase === "grillWaitingForAnswers" && (
+                <section
+                  className="grid gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3"
+                  aria-label={`Grill questions for Run #${run.id}`}
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <strong className="block text-sm">Grill questions</strong>
+                      <span className="text-xs text-muted-foreground">
+                        Answer the complete group once. Mission Manager will
+                        send one numbered response to the same Pane.
+                      </span>
+                    </div>
+                    {nextActions.map((action) => (
+                      <Button
+                        key={action}
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        title={
+                          action === "to-spec"
+                            ? "Stop grilling and write the spec now; the open questions go into the spec."
+                            : `Leave these questions to their recommendations and continue with ${action}.`
+                        }
+                        disabled={isSaving || run.pane_status !== "available"}
+                        onClick={() => void handleContinueGrill(run, action)}
+                      >
+                        Skip to {action}
+                      </Button>
+                    ))}
+                  </div>
+                  <GrillQuestionFlow
+                    key={questionKey}
+                    run={run}
+                    answers={answers}
+                    disabled={isSaving}
+                    onAnswerChange={(questionNumber, answer) =>
+                      onGrillDraftsChange((current) => ({
+                        ...current,
+                        [questionKey]: {
+                          ...(current[questionKey] ?? persistedAnswers),
+                          [questionNumber]: answer,
+                        },
+                      }))
+                    }
+                    onSubmit={(submitted) =>
+                      handleSubmitGrillAnswers(run, questionKey, submitted)
+                    }
+                  />
+                </section>
+              )}
+              {run.execution_profile === "grill" && run.transcript && (
+                <details className="rounded-md border bg-background/60 p-2 text-xs">
+                  <summary className="cursor-pointer font-medium">
+                    Retained Grill transcript
+                  </summary>
+                  <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap font-mono text-muted-foreground">
+                    {run.transcript}
+                  </pre>
+                </details>
+              )}
+              {(run.pane_status === "missing" ||
+                projection.phase === "grillRecoverablePaneLoss") && (
+                <span className="text-xs text-destructive">
+                  Pane unavailable. This Run is preserved and recoverable;
+                  reconnect the exact Pane or use the terminal escape hatch when
+                  the runtime returns.
+                </span>
+              )}
+              {run.pane_status === "unknown" && (
+                <span className="text-xs text-muted-foreground">
+                  Pane status not confirmed.
+                </span>
+              )}
+              {projection.phase === "grillAwaitingNextAction" && (
+                  <div className="grid gap-2 rounded-md border border-primary/30 bg-primary/5 p-3">
+                    <div>
+                      <strong className="block text-sm">
+                        Grill completed · choose the next action
+                      </strong>
+                      <span className="text-xs text-muted-foreground">
+                        Each action continues this Run in the same Pane and
+                        working directory. Finish or stop remains explicit.
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {nextActions.map((action) => (
+                        <Button
+                          key={action}
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={isSaving || run.pane_status !== "available"}
+                          onClick={() => void handleContinueGrill(run, action)}
+                        >
+                          {action}
+                        </Button>
+                      ))}
+                    </div>
+                    {run.pane_status !== "available" && (
+                      <span className="text-xs text-destructive">
+                        Reconnect the exact Pane before continuing this Run.
+                      </span>
+                    )}
+                  </div>
+                )}
+              {run.workspace_id !== null && (
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={isSaving}
+                    onClick={() => onOpenTerminal(run.id, paneTabForRun(run))}
+                  >
+                    {run.pane_status === "missing" ||
+                    run.grill_phase === "recoverablePaneLoss"
+                      ? "Reconnect embedded terminal"
+                      : "Open embedded terminal"}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={isSaving}
+                    onClick={() =>
+                      void saveItem(
+                        workActions.openExternalTerminal(run.id),
+                        false,
+                      )
+                    }
+                  >
+                    Open in Terminal
+                  </Button>
+                  {projection.continuations.stop && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={isSaving}
+                      onClick={() => handleStopRun(run)}
+                    >
+                      Stop Run
+                    </Button>
+                  )}
+                  {projection.continuations.finish && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={isSaving}
+                      onClick={() => handleFinishRun(run)}
+                    >
+                      Finish Run
+                    </Button>
+                  )}
+                  {projection.continuations.delete && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="destructive"
+                      disabled={isSaving}
+                      onClick={() => handleDeleteRun(run)}
+                    >
+                      Delete finished Run
+                    </Button>
+                  )}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * The plan lives in the Run's working directory on its Machine. A local
+ * Machine reveals it in the file manager; a remote one can only show where it is.
+ */
+function PlanLink({ run, machine }: { run: Run; machine: Machine | undefined }) {
+  if (!run.plan_path) {
+    return <span className="text-muted-foreground">Plan path not reported</span>;
+  }
+  const path = run.plan_path.startsWith("/")
+    ? run.plan_path
+    : `${run.working_directory.replace(/\/+$/, "")}/${run.plan_path}`;
+  if (machine?.transport.kind !== "local") {
+    return <code className="break-all text-xs">{path}</code>;
+  }
+  return (
+    <button
+      type="button"
+      className="break-all text-left text-primary underline"
+      title={path}
+      onClick={() =>
+        void window.desktop.revealItemInDir(path).catch((error: unknown) =>
+          window.alert(errorMessage(error)),
+        )
+      }
+    >
+      {run.plan_path}
+    </button>
+  );
+}

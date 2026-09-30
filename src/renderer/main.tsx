@@ -1,30 +1,19 @@
-import React from "react";
+import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { RouterProvider } from "@tanstack/react-router";
+
+import { queryClient } from "./query-client";
+import { router } from "./router";
 import "./styles.css";
+import { initializeTheme } from "./theme";
 
-function App() {
-  const electronVersion = window.desktop?.versions.electron ?? "indisponível";
-
-  return (
-    <main className="shell">
-      <section className="welcome-card">
-        <div className="eyebrow">AI Mission Manager</div>
-        <h1>Seu próximo objetivo começa aqui.</h1>
-        <p>
-          O ambiente desktop está pronto. Este espaço será a base para organizar missões, acompanhar
-          progresso e trabalhar com IA.
-        </p>
-        <div className="status">
-          <span className="status-dot" />
-          Electron {electronVersion} conectado
-        </div>
-      </section>
-    </main>
-  );
-}
+initializeTheme();
 
 createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} context={{ queryClient }} />
+    </QueryClientProvider>
+  </StrictMode>,
 );

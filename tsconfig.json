@@ -7,6 +7,7 @@
     "skipLibCheck": true,
     "moduleResolution": "Bundler",
     "allowImportingTsExtensions": true,
+    "paths": { "@/*": ["./src/renderer/*"] },
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
@@ -15,7 +16,7 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "types": ["vite/client"]
+    "types": ["vite/client", "node"]
   },
-  "include": ["src/renderer"]
+  "include": ["src"]
 }

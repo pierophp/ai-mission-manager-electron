@@ -1,0 +1,850 @@
+import {
+  type DragEvent,
+  type FormEvent,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { Alert, AlertDescription, AlertTitle } from "../../components/ui/alert";
+import { Badge } from "../../components/ui/badge";
+import { Button } from "../../components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "../../components/ui/card";
+import { Checkbox } from "../../components/ui/checkbox";
+import { Input } from "../../components/ui/input";
+import {
+  NativeSelect,
+  NativeSelectOption,
+} from "../../components/ui/native-select";
+import { Textarea } from "../../components/ui/textarea";
+import { currentMinute } from "../../runtime/time";
+import { errorMessage } from "../../runtime/errors";
+import { ExternalUrlLink } from "../../components/ExternalUrlLink";
+import type {
+  AttentionEntry,
+  ExternalChangePolicy,
+  ExternalLinkView,
+  ExternalComment,
+  ItemView,
+  LinkPurpose,
+  RunSuggestion,
+} from "../../runtime/types";
+import { ItemCard } from "./item-card";
+import type { ItemForm } from "./item-signals";
+import {
+  displayItemIdentifier,
+} from "./item-signals";
+import {
+  externalObjectKindLabel,
+  externalProviderLabel,
+  formatSnapshotAge,
+  orderHomeColumnItems,
+  parseHomeColumnOrder,
+} from "./work-utils";
+import { useWorkCommand, workActions } from "./work-commands";
+import {
+  useExternalCommentsQuery,
+  useExternalDocumentQuery,
+} from "./work-queries";
+
+export function HomeColumn({
+  title,
+  hint,
+  items,
+  orderKey,
+  onOpenItem,
+  onChanged,
+}: {
+  title: string;
+  hint: string;
+  items: ItemView[];
+  orderKey: string;
+  onOpenItem: (itemId: number, form?: ItemForm) => void;
+  onChanged: () => Promise<void>;
+}) {
+  const [savedItemIds, setSavedItemIds] = useState<number[]>(() => {
+    try {
+      return parseHomeColumnOrder(window.localStorage.getItem(orderKey));
+    } catch {
+      return [];
+    }
+  });
+  const orderedItems = useMemo(
+    () => orderHomeColumnItems(items, savedItemIds),
+    [items, savedItemIds],
+  );
+
+  useEffect(() => {
+    try {
+      const nextSavedIds = parseHomeColumnOrder(
+        window.localStorage.getItem(orderKey),
+      );
+      const orderedIds = orderHomeColumnItems(items, nextSavedIds).map(
+        (view) => view.item.id,
+      );
+      setSavedItemIds(orderedIds);
+      window.localStorage.setItem(orderKey, JSON.stringify(orderedIds));
+    } catch {
+      // Keep the newest-first in-memory order if local storage is unavailable.
+    }
+  }, [items, orderKey]);
+
+  function moveItem(draggedItemId: number, targetItemId: number) {
+    const nextItemIds = orderedItems.map((view) => view.item.id);
+    const fromIndex = nextItemIds.indexOf(draggedItemId);
+    const targetIndex = nextItemIds.indexOf(targetItemId);
+    if (fromIndex === -1 || targetIndex === -1 || fromIndex === targetIndex)
+      return;
+    nextItemIds.splice(fromIndex, 1);
+    nextItemIds.splice(targetIndex, 0, draggedItemId);
+    setSavedItemIds(nextItemIds);
+    try {
+      window.localStorage.setItem(orderKey, JSON.stringify(nextItemIds));
+    } catch {
+      // The cards stay in the requested order until the view is reloaded.
+    }
+  }
+
+  function handleDrop(event: DragEvent<HTMLDivElement>, targetItemId: number) {
+    event.preventDefault();
+    const draggedItemId = Number(event.dataTransfer.getData("text/plain"));
+    if (Number.isFinite(draggedItemId)) moveItem(draggedItemId, targetItemId);
+  }
+
+  return (
+    <section className="min-w-0 space-y-3" aria-labelledby={`${title}-heading`}>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3
+            id={`${title}-heading`}
+            className="font-heading text-base font-medium normal-case tracking-normal text-foreground"
+          >
+            {title}
+          </h3>
+          <span className="text-xs text-muted-foreground">{hint}</span>
+        </div>
+        <Badge variant="secondary">{items.length}</Badge>
+      </div>
+      <p className="sr-only">Drag cards to change their order.</p>
+      {items.length === 0 ? (
+        <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+          Nothing here.
+        </p>
+      ) : (
+        <div className="grid gap-3" role="list">
+          {orderedItems.map((view) => (
+            <div
+              key={view.item.id}
+              role="listitem"
+              draggable
+              onDragStart={(event) =>
+                event.dataTransfer.setData("text/plain", String(view.item.id))
+              }
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => handleDrop(event, view.item.id)}
+              className="cursor-grab active:cursor-grabbing"
+              aria-label={`Reorder ${view.item.title}`}
+              title="Drag to reorder"
+            >
+              <ItemCard
+                view={view}
+                onOpen={(form) => onOpenItem(view.item.id, form)}
+                onChanged={onChanged}
+              />
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function ExternalLinkCard({
+  externalLink,
+  isActive = true,
+  isSaving,
+  onRefresh,
+  onUnlink,
+  onPrepareDeleteObject,
+  onSetPurpose,
+  specs,
+  onSavePolicy,
+  onMarkReviewed,
+  onSaveWatchUntil,
+  onSaveReviewAt,
+  onClearReviewAt,
+  onAddComment,
+}: {
+  externalLink: ExternalLinkView;
+  isActive?: boolean;
+  isSaving: boolean;
+  onRefresh: () => Promise<void>;
+  onUnlink: () => void | Promise<void>;
+  onPrepareDeleteObject: () => Promise<void>;
+  onSetPurpose: (
+    purpose: LinkPurpose,
+    specExternalObjectId: number | null,
+  ) => Promise<void>;
+  specs: ExternalLinkView[];
+  onSavePolicy: (policy: ExternalChangePolicy | null) => Promise<void>;
+  onMarkReviewed: () => Promise<void>;
+  onSaveWatchUntil: (watchUntil: string | null) => Promise<void>;
+  onSaveReviewAt: (reviewAt: string | null) => Promise<void>;
+  onClearReviewAt: () => Promise<void>;
+  onAddComment: (body: string) => Promise<void>;
+}) {
+  const { object, snapshot } = externalLink;
+  const [policy, setPolicy] = useState(externalLink.attention_policy);
+  const [watchUntil, setWatchUntil] = useState(
+    externalLink.link.watch_until ?? "",
+  );
+  const [reviewAt, setReviewAt] = useState(externalLink.link.review_at ?? "");
+  const [comment, setComment] = useState("");
+  const [isCommenting, setIsCommenting] = useState(false);
+  const localMarkdown =
+    object.provider === "generic" && object.external_key.startsWith("local:");
+  const readable = object.kind !== "generic" || localMarkdown;
+  const document = useExternalDocumentQuery(object.id, isActive && readable);
+  const comments = useExternalCommentsQuery(object.id, isActive && readable);
+  const reviewDateReached =
+    externalLink.link.review_at !== null &&
+    externalLink.link.review_at <= currentMinute();
+
+  useEffect(() => {
+    setPolicy(externalLink.attention_policy);
+    setWatchUntil(externalLink.link.watch_until ?? "");
+    setReviewAt(externalLink.link.review_at ?? "");
+  }, [
+    externalLink.attention_policy,
+    externalLink.link.review_at,
+    externalLink.link.watch_until,
+  ]);
+
+  async function handleComment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!comment.trim()) return;
+    setIsCommenting(true);
+    try {
+      await onAddComment(comment);
+      setComment("");
+      await comments.refetch();
+    } catch (commentError) {
+      window.alert(errorMessage(commentError));
+    } finally {
+      setIsCommenting(false);
+    }
+  }
+
+  return (
+    <Card size="sm">
+      <CardHeader className="border-b border-border/70">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <CardTitle className="text-sm">
+              <ExternalUrlLink
+                href={object.canonical_url}
+                className="underline-offset-4 hover:underline"
+              >
+                {snapshot?.title ?? object.canonical_url}
+              </ExternalUrlLink>
+            </CardTitle>
+            <CardDescription className="mt-1">
+              {localMarkdown ? "Markdown file" : externalObjectKindLabel(object.kind)} ·{" "}
+              {localMarkdown ? "Local Markdown" : externalProviderLabel(object.provider)} ·{" "}
+              {snapshot?.state ?? "Not fetched"}
+            </CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {object.provider === "github" && (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={isSaving}
+                onClick={() => void onRefresh()}
+              >
+                Refresh
+              </Button>
+            )}
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              disabled={isSaving}
+              onClick={() => void onUnlink()}
+            >
+              Unlink this Item
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="text-destructive hover:text-destructive"
+              disabled={isSaving}
+              onClick={() => void onPrepareDeleteObject()}
+            >
+              Remove local object…
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-3 pt-4">
+        <ExternalUrlLink
+          href={object.canonical_url}
+          className="break-all text-sm text-primary underline-offset-4 hover:underline"
+        >
+          {object.canonical_url}
+        </ExternalUrlLink>
+        <label className="grid grid-cols-[max-content_minmax(0,1fr)] items-center gap-2 text-sm">
+          <span>Link type</span>
+          <NativeSelect
+            aria-label="Link type"
+            value={externalLink.link.purpose}
+            disabled={isSaving}
+            onChange={(event) =>
+              void onSetPurpose(
+                event.target.value as LinkPurpose,
+                event.target.value === "to-tickets"
+                  ? externalLink.link.spec_external_object_id
+                  : null,
+              )
+            }
+          >
+            <NativeSelectOption
+              value="to-spec"
+              disabled={!externalLink.supports_implementation_spec}
+            >
+              Spec
+            </NativeSelectOption>
+            <NativeSelectOption
+              value="to-tickets"
+              disabled={!externalLink.supports_implementation_ticket}
+            >
+              Tickets
+            </NativeSelectOption>
+            <NativeSelectOption value="others">Others</NativeSelectOption>
+          </NativeSelect>
+        </label>
+        {externalLink.link.purpose === "to-tickets" && (
+          <label className="grid grid-cols-[max-content_minmax(0,1fr)] items-center gap-2 text-sm">
+            <span>Spec</span>
+            <NativeSelect
+              aria-label="Ticket spec"
+              value={externalLink.link.spec_external_object_id ?? ""}
+              disabled={isSaving || specs.length === 0}
+              onChange={(event) =>
+                void onSetPurpose(
+                  "to-tickets",
+                  Number(event.target.value) || null,
+                )
+              }
+            >
+              <NativeSelectOption value="" disabled>
+                {specs.length === 0
+                  ? "No specs linked to this Item"
+                  : "Select a spec…"}
+              </NativeSelectOption>
+              {specs.map((spec) => (
+                <NativeSelectOption value={spec.object.id} key={spec.object.id}>
+                  {spec.snapshot?.title ?? spec.object.canonical_url}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          </label>
+        )}
+        {externalLink.link.provenance && (
+          <p className="m-0 text-xs text-muted-foreground">
+            Discovered by Run #{externalLink.link.provenance.run_id} via{" "}
+            {externalLink.link.provenance.action} ·{" "}
+            {externalLink.link.provenance.discovery === "structured-event"
+              ? "structured Issue-created event"
+              : "Run output URL"}
+          </p>
+        )}
+        {snapshot ? (
+          <>
+            <div className="flex flex-wrap gap-2">
+              {snapshot.metadata.map((metadata) => (
+                <Badge variant="secondary" key={metadata.key}>
+                  {metadata.key}: {metadata.value}
+                </Badge>
+              ))}
+            </div>
+            <p className="m-0 text-xs text-muted-foreground">
+              Fetched {formatSnapshotAge(snapshot.fetched_at)}
+            </p>
+          </>
+        ) : (
+          <p className="m-0 text-xs text-muted-foreground">No snapshot yet</p>
+        )}
+        {readable && (
+          <section
+            className="grid gap-2 rounded-md border p-3"
+            aria-label="External content and comments"
+          >
+            <h4 className="m-0 text-sm font-medium">Description</h4>
+            {document.isPending ? (
+              <p className="m-0 text-sm text-muted-foreground">
+                Reading description…
+              </p>
+            ) : document.isError ? (
+              <p className="m-0 text-sm text-destructive">
+                Could not read description: {errorMessage(document.error)}
+              </p>
+            ) : document.data ? (
+              <div className="markdown-body min-w-0 text-sm">
+                <Markdown remarkPlugins={[remarkGfm]}>{document.data}</Markdown>
+              </div>
+            ) : null}
+            <h4 className="m-0 mt-2 text-sm font-medium">Comments</h4>
+            {comments.isPending ? (
+              <p className="m-0 text-sm text-muted-foreground">
+                Reading comments…
+              </p>
+            ) : comments.isError ? (
+              <p className="m-0 text-sm text-destructive">
+                Could not read comments: {errorMessage(comments.error)}
+              </p>
+            ) : comments.data?.length ? (
+              <div className="grid gap-2">
+                {comments.data.map((entry: ExternalComment) => (
+                  <article
+                    key={entry.id}
+                    className="grid gap-1 rounded border p-2"
+                  >
+                    <p className="m-0 text-xs text-muted-foreground">
+                      {entry.author} · {entry.createdAt}
+                    </p>
+                    <div className="markdown-body min-w-0 text-sm">
+                      <Markdown remarkPlugins={[remarkGfm]}>
+                        {entry.body}
+                      </Markdown>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <p className="m-0 text-sm text-muted-foreground">No comments.</p>
+            )}
+          </section>
+        )}
+        {object.provider === "github" && object.kind !== "generic" && (
+          <form className="grid gap-2" onSubmit={handleComment}>
+            <label className="grid gap-1.5 text-sm font-medium">
+              <span>Comment on GitHub</span>
+              <Textarea
+                value={comment}
+                onChange={(event) => setComment(event.target.value)}
+                rows={2}
+                placeholder="Write a short public reply"
+                disabled={isSaving || isCommenting}
+              />
+            </label>
+            <Button
+              type="submit"
+              size="sm"
+              variant="outline"
+              disabled={isSaving || isCommenting || !comment.trim()}
+            >
+              {isCommenting ? "Posting…" : "Add comment"}
+            </Button>
+          </form>
+        )}
+        {reviewDateReached && (
+          <Alert>
+            <AlertTitle>Review date reached</AlertTitle>
+            <AlertDescription>
+              Review scheduled for {externalLink.link.review_at}
+            </AlertDescription>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={isSaving}
+              onClick={() => void onClearReviewAt()}
+            >
+              Clear review date
+            </Button>
+          </Alert>
+        )}
+        {externalLink.attention_entry && (
+          <Alert>
+            <AlertTitle>
+              {externalLink.attention_entry.kind === "review"
+                ? "Review date reached"
+                : "Needs review"}
+            </AlertTitle>
+            <AlertDescription>
+              {externalLink.attention_entry.summary}
+            </AlertDescription>
+            {externalLink.attention_entry.kind === "review" ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={isSaving}
+                onClick={() => void onClearReviewAt()}
+              >
+                Clear review date
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={isSaving}
+                onClick={() => void onMarkReviewed()}
+              >
+                Mark changes reviewed
+              </Button>
+            )}
+          </Alert>
+        )}
+        <div className="grid gap-3 rounded-md border p-3">
+          <span className="text-sm font-medium">Watch schedule</span>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="grid gap-1.5 text-sm font-medium">
+              <span>Watch until</span>
+              <Input
+                type="datetime-local"
+                value={watchUntil}
+                onChange={(event) => setWatchUntil(event.target.value)}
+                disabled={isSaving}
+              />
+            </label>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={isSaving}
+              onClick={() => void onSaveWatchUntil(watchUntil || null)}
+            >
+              Save watch period
+            </Button>
+            <label className="grid gap-1.5 text-sm font-medium">
+              <span>Review at</span>
+              <Input
+                type="datetime-local"
+                value={reviewAt}
+                onChange={(event) => setReviewAt(event.target.value)}
+                disabled={isSaving}
+              />
+            </label>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={isSaving}
+              onClick={() => void onSaveReviewAt(reviewAt || null)}
+            >
+              Save review date
+            </Button>
+          </div>
+        </div>
+        <div className="grid gap-3 rounded-md border p-3">
+          <span className="text-sm font-medium">Attention for this Link</span>
+          <div className="flex flex-wrap gap-4">
+            <label className="flex items-center gap-2 text-sm font-normal">
+              <Checkbox
+                checked={policy.title}
+                onCheckedChange={(checked) =>
+                  setPolicy((current) => ({
+                    ...current,
+                    title: checked === true,
+                  }))
+                }
+                disabled={isSaving}
+              />
+              Title
+            </label>
+            <label className="flex items-center gap-2 text-sm font-normal">
+              <Checkbox
+                checked={policy.state}
+                onCheckedChange={(checked) =>
+                  setPolicy((current) => ({
+                    ...current,
+                    state: checked === true,
+                  }))
+                }
+                disabled={isSaving}
+              />
+              State
+            </label>
+            <label className="flex items-center gap-2 text-sm font-normal">
+              <Checkbox
+                checked={policy.metadata}
+                onCheckedChange={(checked) =>
+                  setPolicy((current) => ({
+                    ...current,
+                    metadata: checked === true,
+                  }))
+                }
+                disabled={isSaving}
+              />
+              Metadata
+            </label>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={isSaving}
+              onClick={() => void onSavePolicy(policy)}
+            >
+              Save Link policy
+            </Button>
+            {externalLink.link.attention_policy && (
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                disabled={isSaving}
+                onClick={() => void onSavePolicy(null)}
+              >
+                Use Context default
+              </Button>
+            )}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+export function AttentionEntryCard({
+  entry,
+  item,
+  onMarkedReviewed,
+}: {
+  entry: AttentionEntry;
+  item: ItemView | undefined;
+  onMarkedReviewed: () => Promise<void>;
+}) {
+  const [isSaving, setIsSaving] = useState(false);
+  const workCommand = useWorkCommand();
+
+  async function markReviewed() {
+    setIsSaving(true);
+    try {
+      await workCommand.execute(workActions.markLinkReviewed(entry.link_id));
+      await onMarkedReviewed();
+    } catch (reviewError) {
+      window.alert(errorMessage(reviewError));
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  return (
+    <Card size="sm">
+      <CardContent className="flex flex-wrap items-center justify-between gap-3 pt-4">
+        <div className="min-w-0">
+          <strong className="block text-sm">{entry.source_title}</strong>
+          <span className="text-xs text-muted-foreground">
+            {displayItemIdentifier(item?.item.human_identifier ?? "Item")} ·{" "}
+            {attentionEntryLabel(entry)}
+          </span>
+        </div>
+        <p className="m-0 min-w-0 flex-1 text-sm text-muted-foreground">
+          {entry.summary}
+        </p>
+        {entry.kind === "reminder" && item && entry.reminder_id !== null ? (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={isSaving}
+            onClick={() =>
+              void saveReminder(item.item.id, entry.reminder_id as number)
+            }
+          >
+            Dismiss reminder
+          </Button>
+        ) : entry.kind === "review" ? (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={isSaving}
+            onClick={() => void clearReviewDate()}
+          >
+            Clear review date
+          </Button>
+        ) : entry.kind === "blocked_run" ? (
+          <span className="text-xs text-muted-foreground">
+            Open the Run to answer the agent.
+          </span>
+        ) : entry.kind === "implementation_queue" ? (
+          <span className="text-xs text-muted-foreground">
+            Open the Item’s Spec tab to recover the queue.
+          </span>
+        ) : (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={isSaving}
+            onClick={() => void markReviewed()}
+          >
+            Mark reviewed
+          </Button>
+        )}
+      </CardContent>
+    </Card>
+  );
+
+  async function saveReminder(itemId: number, reminderId: number) {
+    setIsSaving(true);
+    try {
+      await workCommand.execute(workActions.removeReminder(itemId, reminderId));
+      await onMarkedReviewed();
+    } catch (dismissError) {
+      window.alert(errorMessage(dismissError));
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function clearReviewDate() {
+    setIsSaving(true);
+    try {
+      await workCommand.execute(workActions.clearLinkReviewAt(entry.link_id));
+      await onMarkedReviewed();
+    } catch (clearError) {
+      window.alert(errorMessage(clearError));
+    } finally {
+      setIsSaving(false);
+    }
+  }
+}
+
+export function RunSuggestionCard({
+  suggestion,
+  disabled,
+  onAttach,
+  onStop,
+  onDelete,
+}: {
+  suggestion: RunSuggestion;
+  disabled: boolean;
+  onAttach: (suggestion: RunSuggestion) => Promise<void>;
+  onStop: (suggestion: RunSuggestion) => void;
+  onDelete: (suggestion: RunSuggestion) => void;
+}) {
+  return (
+    <Card size="sm">
+      <CardContent className="grid gap-3 pt-4 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] md:items-center xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+        <div className="grid gap-1">
+          <strong className="text-sm">
+            {suggestion.agent === "claude" ? "Claude Code" : "Codex"} in{" "}
+            {suggestion.machineName}
+          </strong>
+          <span className="text-xs text-muted-foreground">
+            {displayItemIdentifier(suggestion.itemIdentifier)} ·{" "}
+            {suggestion.itemTitle} · {suggestion.contextName}
+          </span>
+        </div>
+        <div className="grid gap-1 text-xs">
+          <strong>
+            {suggestion.workspaceId
+              ? suggestion.worktreeId
+                ? "Registered Worktree"
+                : "Registered direct checkout"
+              : "Unregistered working location"}
+          </strong>
+          <span className="break-all text-muted-foreground">
+            {suggestion.locationPath ?? suggestion.currentPath}
+          </span>
+          {suggestion.repositoryId !== null && (
+            <span className="text-muted-foreground">
+              Repository #{suggestion.repositoryId}
+            </span>
+          )}
+          <code className="break-all text-muted-foreground">
+            Session {suggestion.sessionName} · Pane {suggestion.paneId} ·{" "}
+            {suggestion.currentPath}
+          </code>
+        </div>
+        <div className="flex flex-wrap justify-end gap-2 md:col-span-2 xl:col-span-1">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={disabled}
+            onClick={() => void onAttach(suggestion)}
+          >
+            Attach Run
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={disabled}
+            onClick={() => onStop(suggestion)}
+          >
+            Stop
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="destructive"
+            disabled={disabled}
+            onClick={() => onDelete(suggestion)}
+          >
+            Delete
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function attentionEntryLabel(entry: AttentionEntry): string {
+  if (entry.kind === "reminder") return "Reminder due";
+  if (entry.kind === "review") return "Review date reached";
+  if (entry.kind === "blocked_run") return "Run blocked";
+  if (entry.kind === "implementation_queue")
+    return "Implementation Queue paused";
+  return `${entry.activities.length} change${entry.activities.length === 1 ? "" : "s"}`;
+}
+
+export function SearchResult({
+  view,
+  onOpen,
+}: {
+  view: ItemView;
+  onOpen: () => void;
+}) {
+  return (
+    <Card size="sm">
+      <CardContent className="pt-4">
+        <button
+          type="button"
+          className="flex w-full items-center gap-3 rounded-md text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+          onClick={onOpen}
+        >
+          <Badge variant="outline">
+            {displayItemIdentifier(view.item.human_identifier)}
+          </Badge>
+          <div>
+            <h3 className="font-heading text-sm font-medium normal-case tracking-normal text-foreground">
+              {view.item.title}
+            </h3>
+            <p className="m-0 text-xs text-muted-foreground">
+              {view.context_name} <span>·</span> {view.project_name}{" "}
+              <span>·</span> {view.item.status}
+            </p>
+          </div>
+        </button>
+      </CardContent>
+    </Card>
+  );
+}

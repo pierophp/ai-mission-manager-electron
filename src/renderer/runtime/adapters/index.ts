@@ -1,0 +1,1 @@
+export { terminalRuntimeAdapter } from "./terminal";
