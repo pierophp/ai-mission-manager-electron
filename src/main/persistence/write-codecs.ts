@@ -1,5 +1,6 @@
 import type { Context } from "../../domain/types";
 import type { MachineTransport } from "../../domain/types";
+import type { ItemRelation } from "../../domain/types";
 
 /** Serializes the Rust internally-tagged enum and variant fields in declaration order. */
 export function encodeMachineTransport(transport: MachineTransport): string {
@@ -40,4 +41,14 @@ export function encodeProjectCreatedAudit(projectId: number): string {
 
 export function encodeRepositoryRegisteredAudit(repositoryId: number): string {
   return JSON.stringify({ action: "repositoryRegistered", repository_id: repositoryId });
+}
+
+/** Keeps Rust's enum name casing in audit JSON while SQLite uses snake_case. */
+export function encodeItemRelationChangedAudit(relation: ItemRelation): string {
+  return JSON.stringify({
+    action: "itemRelationChanged",
+    from_item_id: relation.from_item_id,
+    to_item_id: relation.to_item_id,
+    kind: relation.kind,
+  });
 }

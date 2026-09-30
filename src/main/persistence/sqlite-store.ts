@@ -31,6 +31,7 @@ import {
 import { openSqliteDatabase } from "./schema";
 import {
   encodeContextCreatedAudit,
+  encodeItemRelationChangedAudit,
   encodeMachineTransport,
   encodeProjectCreatedAudit,
   encodePstackRoleTable,
@@ -59,7 +60,8 @@ export class SqliteStore {
       (effect) =>
         effect.type === "persist_context" ||
         effect.type === "persist_project" ||
-        effect.type === "persist_repository",
+        effect.type === "persist_repository" ||
+        effect.type === "persist_item_relation",
     );
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -75,6 +77,8 @@ export class SqliteStore {
           action = encodeProjectCreatedAudit(effect.project.id);
         else if (effect.type === "persist_repository")
           action = encodeRepositoryRegisteredAudit(effect.repository.id);
+        else if (effect.type === "persist_item_relation")
+          action = encodeItemRelationChangedAudit(effect.relation);
         else continue;
         this.database
           .prepare(
@@ -295,6 +299,59 @@ export class SqliteStore {
         );
         this.persistWorkspaceRepositories(effect.workspace);
         break;
+      case "persist_item":
+        db.prepare(
+          "INSERT INTO items(id,human_identifier,title,project_id,status,notes) VALUES(?,?,?,?,?,?)",
+        ).run(
+          effect.item.id,
+          effect.item.human_identifier,
+          effect.item.title,
+          effect.item.project_id,
+          effect.item.status,
+          effect.item.notes,
+        );
+        db.prepare("UPDATE metadata SET value=? WHERE key='next_item_id'").run(effect.nextItemId);
+        db.prepare("UPDATE metadata SET value=? WHERE key='next_item_number'").run(
+          effect.nextItemNumber,
+        );
+        break;
+      case "persist_item_update":
+        db.prepare("UPDATE items SET title=?,status=?,notes=? WHERE id=?").run(
+          effect.item.title,
+          effect.item.status,
+          effect.item.notes,
+          effect.item.id,
+        );
+        break;
+      case "persist_item_reminders":
+        db.prepare("UPDATE items SET title=?,status=?,notes=? WHERE id=?").run(
+          effect.item.title,
+          effect.item.status,
+          effect.item.notes,
+          effect.item.id,
+        );
+        db.prepare("DELETE FROM reminders WHERE item_id=?").run(effect.item.id);
+        for (const reminder of effect.item.reminders)
+          db.prepare("INSERT INTO reminders(id,item_id,remind_at) VALUES(?,?,?)").run(
+            reminder.id,
+            effect.item.id,
+            reminder.remind_at,
+          );
+        db.prepare("UPDATE metadata SET value=? WHERE key='next_reminder_id'").run(
+          effect.nextReminderId,
+        );
+        break;
+      case "persist_item_relation": {
+        const kind = {
+          Blocks: "blocks",
+          BlockedBy: "blocked_by",
+          RelatedTo: "related_to",
+        }[effect.relation.kind];
+        db.prepare(
+          "INSERT INTO item_relationships(from_item_id,to_item_id,kind) VALUES(?,?,?)",
+        ).run(effect.relation.from_item_id, effect.relation.to_item_id, kind);
+        break;
+      }
       case "update_context":
         persist(effect.context);
         break;

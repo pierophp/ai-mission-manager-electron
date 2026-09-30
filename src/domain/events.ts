@@ -12,6 +12,9 @@ import type {
   AgentKind,
   WorkspaceRepositoryInput,
   ProviderChoice,
+  ItemStatus,
+  Item,
+  ItemRelation,
 } from "./types";
 import type { DomainState } from "./model";
 
@@ -95,6 +98,13 @@ export type Event =
     }
   | { type: "delete_cli_configuration_profile"; profileId: number }
   | { type: "create_workspace"; itemId: number; repositories: WorkspaceRepositoryInput[] }
+  | { type: "create_item"; title: string; contextId: number; projectId: number; notes: string }
+  | { type: "set_item_status"; itemId: number; status: ItemStatus }
+  | { type: "set_item_title"; itemId: number; title: string }
+  | { type: "set_item_notes"; itemId: number; notes: string }
+  | { type: "add_item_reminder"; itemId: number; remindAt: string }
+  | { type: "remove_item_reminder"; itemId: number; reminderId: number }
+  | { type: "set_item_relation"; fromItemId: number; toItemId: number; kind: ItemRelation["kind"] }
   | {
       type: "set_workspace_repositories";
       workspaceId: number;
@@ -140,6 +150,10 @@ export type Effect =
       workspace: DomainState["workspaces"][number];
       nextWorkspaceId: number;
     }
-  | { type: "persist_workspace_update"; workspace: DomainState["workspaces"][number] };
+  | { type: "persist_workspace_update"; workspace: DomainState["workspaces"][number] }
+  | { type: "persist_item"; item: Item; nextItemId: number; nextItemNumber: number }
+  | { type: "persist_item_update"; item: Item }
+  | { type: "persist_item_reminders"; item: Item; nextReminderId: number }
+  | { type: "persist_item_relation"; relation: ItemRelation };
 
 export type Decision = { state: import("./model").DomainState; effects: Effect[] };

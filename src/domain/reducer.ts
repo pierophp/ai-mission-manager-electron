@@ -601,6 +601,121 @@ export function decide(state: DomainState, event: Event): Decision {
       effects.push({ type: "remove_cli_configuration_profile", profileId: event.profileId });
       break;
     }
+    case "create_item": {
+      if (!event.title.trim()) throw new DomainError("an Item title cannot be blank");
+      const owner = context(event.contextId);
+      const project = next.projects.find((candidate) => candidate.id === event.projectId);
+      if (!project) throw new DomainError(`Project ${event.projectId} does not exist`);
+      if (project.context_id !== owner.id)
+        throw new DomainError(`Project ${event.projectId} belongs to another Context`);
+      const id = next.next_item_id;
+      const number = next.next_item_number;
+      const nextItemId = id + 1;
+      const nextItemNumber = number + 1;
+      if (!Number.isSafeInteger(nextItemId) || !Number.isSafeInteger(nextItemNumber))
+        throw new DomainError("the Item identifier sequence is exhausted");
+      const item = {
+        id,
+        human_identifier: `I-${number}`,
+        title: event.title.trim(),
+        project_id: project.id,
+        status: project.defaults.item_status,
+        notes: event.notes,
+        reminders: [],
+      };
+      next.next_item_id = nextItemId;
+      next.next_item_number = nextItemNumber;
+      next.items.push(item);
+      effects.push({ type: "persist_item", item, nextItemId, nextItemNumber });
+      break;
+    }
+    case "set_item_status":
+    case "set_item_title":
+    case "set_item_notes": {
+      if (
+        event.type === "set_item_status" &&
+        !["Inbox", "Active", "Waiting", "Done"].includes(event.status)
+      ) {
+        throw new DomainError(
+          `unknown variant \`${String(event.status)}\`, expected one of \`Inbox\`, \`Active\`, \`Waiting\`, \`Done\``,
+        );
+      }
+      const item = next.items.find((candidate) => candidate.id === event.itemId);
+      if (!item) throw new DomainError(`Item ${event.itemId} does not exist`);
+      if (event.type === "set_item_status") item.status = event.status;
+      else if (event.type === "set_item_title") {
+        const title = event.title.trim();
+        if (!title) throw new DomainError("an Item title cannot be blank");
+        item.title = title;
+      } else item.notes = event.notes;
+      effects.push({ type: "persist_item_update", item: structuredClone(item) });
+      break;
+    }
+    case "add_item_reminder": {
+      const item = next.items.find((candidate) => candidate.id === event.itemId);
+      if (!item) throw new DomainError(`Item ${event.itemId} does not exist`);
+      const remindAt = event.remindAt.trim();
+      if (!remindAt) throw new DomainError("a Reminder date cannot be blank");
+      const id = next.next_reminder_id;
+      const nextReminderId = id + 1;
+      if (!Number.isSafeInteger(nextReminderId))
+        throw new DomainError("the Item identifier sequence is exhausted");
+      item.reminders.push({ id, remind_at: remindAt });
+      next.next_reminder_id = nextReminderId;
+      effects.push({ type: "persist_item_reminders", item: structuredClone(item), nextReminderId });
+      break;
+    }
+    case "remove_item_reminder": {
+      const item = next.items.find((candidate) => candidate.id === event.itemId);
+      if (!item) throw new DomainError(`Item ${event.itemId} does not exist`);
+      if (!item.reminders.some((reminder) => reminder.id === event.reminderId))
+        throw new DomainError(
+          `Reminder ${event.reminderId} does not exist on Item ${event.itemId}`,
+        );
+      item.reminders = item.reminders.filter((reminder) => reminder.id !== event.reminderId);
+      effects.push({
+        type: "persist_item_reminders",
+        item: structuredClone(item),
+        nextReminderId: next.next_reminder_id,
+      });
+      break;
+    }
+    case "set_item_relation": {
+      if (!["Blocks", "BlockedBy", "RelatedTo"].includes(event.kind))
+        throw new DomainError(
+          `unknown variant \`${String(event.kind)}\`, expected one of \`Blocks\`, \`BlockedBy\` or \`RelatedTo\``,
+        );
+      if (event.fromItemId === event.toItemId)
+        throw new DomainError(`an Item cannot relate to itself: ${event.fromItemId}`);
+      const itemContext = (itemId: number) => {
+        const item = next.items.find((candidate) => candidate.id === itemId);
+        if (!item) throw new DomainError(`Item ${itemId} does not exist`);
+        const owner = next.projects.find((candidate) => candidate.id === item.project_id);
+        if (!owner) throw new DomainError(`Project ${item.project_id} does not exist`);
+        return owner.context_id;
+      };
+      if (itemContext(event.fromItemId) !== itemContext(event.toItemId))
+        throw new DomainError(
+          `Items ${event.fromItemId} and ${event.toItemId} belong to different Contexts`,
+        );
+      const relation = {
+        from_item_id: event.fromItemId,
+        to_item_id: event.toItemId,
+        kind: event.kind,
+      };
+      if (
+        next.relationships.some(
+          (entry) =>
+            entry.from_item_id === relation.from_item_id &&
+            entry.to_item_id === relation.to_item_id &&
+            entry.kind === relation.kind,
+        )
+      )
+        throw new DomainError("the relationship already exists");
+      next.relationships.push(relation);
+      effects.push({ type: "persist_item_relation", relation });
+      break;
+    }
     case "create_workspace": {
       const item = next.items.find((candidate) => candidate.id === event.itemId);
       if (!item) throw new DomainError(`Item ${event.itemId} does not exist`);

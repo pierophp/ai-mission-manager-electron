@@ -14,6 +14,7 @@ export default defineConfig({
     include: [
       "**/*.{test,spec}.{js,ts,jsx,tsx}",
       "../shared/**/*.{test,spec}.{js,ts,jsx,tsx}",
+      "../domain/**/*.{test,spec}.{js,ts,jsx,tsx}",
       "../main/**/*.{test,spec}.{js,ts,jsx,tsx}",
     ],
     environment: "happy-dom",

@@ -822,6 +822,7 @@ export type AuditAction = {
   activity_count?: number | null;
   from_item_id?: number;
   to_item_id?: number;
+  kind?: ItemRelationKind;
   summary?: ItemDeletionResult["summary"] | ParentDeletionResult["summary"];
 };
 

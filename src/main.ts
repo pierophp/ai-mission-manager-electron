@@ -6,6 +6,7 @@ import { createCommandDispatcher, INVOKE_CHANNEL } from "./shared/ipc";
 import { createReadCommandHandlers } from "./main/persistence/commands";
 import { createStructureCommandHandlers } from "./main/structure-commands";
 import { createSetupCommandHandlers } from "./main/setup";
+import { createWorkCommandHandlers } from "./main/work-commands";
 import { Runtime } from "./main/runtime";
 import { openSqliteStore, type SqliteStore } from "./main/persistence/sqlite-store";
 import { ensureProjectWorkspaces, recoverRunStateRecords } from "./main/persistence/startup";
@@ -141,6 +142,7 @@ if (!hasSingleInstance) {
           ...createReadCommandHandlers(store),
           ...createSetupCommandHandlers(runtime, store),
           ...createStructureCommandHandlers(runtime, undefined, store),
+          ...createWorkCommandHandlers(runtime),
         }),
       );
       mainWindow = createWindow();
