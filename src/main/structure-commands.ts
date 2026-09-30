@@ -2,9 +2,14 @@ import type { Runtime } from "./runtime";
 import type { Event } from "../domain/events";
 import type {
   ContextConfiguration,
+  ExecutionMode,
   ExternalChangePolicy,
   ExternalObjectKind,
   GrillConfiguration,
+  ItemStatus,
+  Project,
+  Repository,
+  RepositoryLocation,
 } from "../domain/types";
 
 export function createStructureCommandHandlers(runtime: Runtime) {
@@ -43,6 +48,14 @@ export function createStructureCommandHandlers(runtime: Runtime) {
     const state = runtime.dispatchMany(events);
     return state.contexts.find((entry) => entry.id === actualId);
   };
+  const defaults = (args: Record<string, unknown>) => ({
+    item_status: String(args.defaultItemStatus ?? "Inbox") as ItemStatus,
+    execution_mode: (args.executionMode ?? "worktree") as ExecutionMode,
+  });
+  const dispatchAndSelectProject = (event: Event, projectId: number) =>
+    runtime.dispatch(event).projects.find((entry) => entry.id === projectId);
+  const dispatchAndSelectRepository = (event: Event, repositoryId: number) =>
+    runtime.dispatch(event).repositories.find((entry) => entry.id === repositoryId);
   return {
     create_context: (args: Record<string, unknown>) =>
       dispatchAndSelectContext({ type: "create_context", name: String(args.name ?? "") }),
@@ -95,6 +108,65 @@ export function createStructureCommandHandlers(runtime: Runtime) {
       });
       return state.attention_defaults.find(
         (row) => row.context_id === Number(args.contextId) && row.object_kind === args.objectKind,
+      );
+    },
+    create_project: (args: Record<string, unknown>): Project | undefined =>
+      dispatchAndSelectProject(
+        {
+          type: "create_project",
+          contextId: Number(args.contextId),
+          name: String(args.name ?? ""),
+          defaults: defaults(args),
+        },
+        runtime.snapshot().next_project_id,
+      ),
+    update_project: (args: Record<string, unknown>) =>
+      dispatchAndSelectProject(
+        {
+          type: "update_project",
+          projectId: Number(args.projectId),
+          name: String(args.name ?? ""),
+          defaults: defaults(args),
+        },
+        Number(args.projectId),
+      ),
+    register_repository: (args: Record<string, unknown>): Repository | undefined =>
+      dispatchAndSelectRepository(
+        {
+          type: "register_repository",
+          projectId: Number(args.projectId),
+          name: String(args.name ?? ""),
+          remoteUrl: String(args.remoteUrl ?? ""),
+        },
+        runtime.snapshot().next_repository_id,
+      ),
+    update_repository: (args: Record<string, unknown>) =>
+      dispatchAndSelectRepository(
+        {
+          type: "update_repository",
+          repositoryId: Number(args.repositoryId),
+          name: String(args.name ?? ""),
+          remoteUrl: String(args.remoteUrl ?? ""),
+          baseBranch: String(args.baseBranch ?? ""),
+        },
+        Number(args.repositoryId),
+      ),
+    update_repository_location: (args: Record<string, unknown>): RepositoryLocation | undefined => {
+      const repositoryId = Number(args.repositoryId);
+      const machineId = Number(args.machineId);
+      const state = runtime.dispatch({
+        type: "update_repository_location",
+        repositoryId,
+        previousMachineId:
+          args.previousMachineId === null || args.previousMachineId === undefined
+            ? null
+            : Number(args.previousMachineId),
+        machineId,
+        checkoutPath: String(args.checkoutPath ?? ""),
+        worktreeRoot: String(args.worktreeRoot ?? ""),
+      });
+      return state.repository_locations.find(
+        (location) => location.repository_id === repositoryId && location.machine_id === machineId,
       );
     },
   };

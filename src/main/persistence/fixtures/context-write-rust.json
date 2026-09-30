@@ -25,7 +25,12 @@
       "title_attention": 1
     }
   ],
-  "audit_action_json": "{\"action\":\"contextCreated\",\"context_id\":2}",
+  "audit_action_jsons": [
+    "{\"action\":\"contextCreated\",\"context_id\":2}",
+    "{\"action\":\"projectCreated\",\"project_id\":2}",
+    "{\"action\":\"projectCreated\",\"project_id\":3}",
+    "{\"action\":\"repositoryRegistered\",\"repository_id\":1}"
+  ],
   "context": {
     "atlassian_site": "https://acme.atlassian.net",
     "az_executable_path": "/tools/az",
@@ -52,11 +57,13 @@
     "twg_executable_path": "/tools/twg"
   },
   "metadata": {
-    "next_audit_id": 2,
+    "next_audit_id": 5,
     "next_cli_profile_id": 3,
     "next_context_id": 3,
     "next_machine_id": 2,
-    "next_project_id": 3
+    "next_project_id": 4,
+    "next_repository_id": 2,
+    "next_workspace_id": 2
   },
   "project": {
     "context_id": 2,
@@ -64,5 +71,14 @@
     "default_item_status": "Inbox",
     "id": 2,
     "name": "Default"
-  }
+  },
+  "projects": [
+    [1, 1, "Default", "Inbox", "worktree"],
+    [2, 2, "Default", "Inbox", "worktree"],
+    [3, 1, "Product Tools", "Waiting", "worktree"]
+  ],
+  "repositories": [[1, 1, "core", "https://github.com/team/core.git", "trunk"]],
+  "repository_locations": [[1, 1, "/work/core", "/worktrees/core"]],
+  "workspace_repositories": [[1, 1, "mission-I-77", "main"]],
+  "workspaces": [[1, 77, "pending"]]
 }

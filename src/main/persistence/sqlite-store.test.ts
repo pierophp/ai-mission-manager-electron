@@ -183,7 +183,7 @@ describe("Rust-compatible SQLite store", () => {
 });
 
 describe("Context write transactions", () => {
-  it("persists Context, Default Project, configuration, metadata, and Rust-shaped audit JSON", async () => {
+  it("persists Context, Default Project, configuration, metadata, and both Rust-shaped audit actions", async () => {
     const { Runtime } = await import("../runtime");
     const store = openSqliteStore(temporaryDatabase());
     const runtime = new Runtime(store);
@@ -203,9 +203,10 @@ describe("Context write transactions", () => {
     expect(
       database.prepare("SELECT value FROM metadata WHERE key='next_context_id'").get(),
     ).toEqual({ value: context.id + 1 });
-    expect(
-      database.prepare("SELECT action_json FROM audit_entries ORDER BY id DESC LIMIT 1").get(),
-    ).toEqual({ action_json: `{"action":"contextCreated","context_id":${context.id}}` });
+    expect(database.prepare("SELECT action_json FROM audit_entries ORDER BY id").all()).toEqual([
+      { action_json: `{"action":"contextCreated","context_id":${context.id}}` },
+      { action_json: `{"action":"projectCreated","project_id":${context.id}}` },
+    ]);
     database.close();
     store.close();
   });
@@ -228,6 +229,11 @@ describe("Context write transactions", () => {
       .run();
     seed.prepare("UPDATE metadata SET value=2 WHERE key='next_machine_id'").run();
     seed.prepare("UPDATE metadata SET value=3 WHERE key='next_cli_profile_id'").run();
+    seed
+      .prepare(
+        "INSERT INTO items(id,human_identifier,title,project_id,status,notes) VALUES(77,'I-77','Compat Item',1,'Inbox','')",
+      )
+      .run();
     seed.close();
     const runtime = new Runtime(store);
     const configuration = newContextConfiguration();
@@ -245,6 +251,37 @@ describe("Context write transactions", () => {
     const context = createStructureCommandHandlers(runtime).create_context_configuration({
       configuration,
     }) as import("../../domain/types").Context;
+    const structureCommands = createStructureCommandHandlers(runtime);
+    structureCommands.create_project({
+      contextId: 1,
+      name: "Tools",
+      defaultItemStatus: "Active",
+      executionMode: "direct",
+    });
+    structureCommands.update_project({
+      projectId: 3,
+      name: "Product Tools",
+      defaultItemStatus: "Waiting",
+      executionMode: "worktree",
+    });
+    structureCommands.register_repository({
+      projectId: 1,
+      name: "core",
+      remoteUrl: "git@github.com:team/core.git",
+    });
+    structureCommands.update_repository({
+      repositoryId: 1,
+      name: "core",
+      remoteUrl: "https://github.com/team/core.git",
+      baseBranch: "trunk",
+    });
+    structureCommands.update_repository_location({
+      repositoryId: 1,
+      previousMachineId: null,
+      machineId: 1,
+      checkoutPath: "/work/core",
+      worktreeRoot: "/worktrees/core",
+    });
     const fixture = JSON.parse(
       readFileSync(
         path.join(process.cwd(), "src/main/persistence/fixtures/context-write-rust.json"),
@@ -254,7 +291,12 @@ describe("Context write transactions", () => {
       context: Record<string, unknown>;
       project: Record<string, unknown>;
       attention_defaults: Record<string, unknown>[];
-      audit_action_json: string;
+      audit_action_jsons: string[];
+      projects: unknown[][];
+      repositories: unknown[][];
+      repository_locations: unknown[][];
+      workspaces: unknown[][];
+      workspace_repositories: unknown[][];
       metadata: Record<string, number>;
     };
     const database = new DatabaseSync(store.path, { readOnly: true });
@@ -273,9 +315,35 @@ describe("Context write transactions", () => {
         "SELECT object_kind,title_attention,state_attention,metadata_attention FROM context_attention_defaults WHERE context_id=? ORDER BY object_kind",
       )
       .all(context.id);
-    const auditRow = database
-      .prepare("SELECT action_json FROM audit_entries ORDER BY id DESC LIMIT 1")
-      .get() as { action_json: string };
+    const auditRows = database
+      .prepare("SELECT action_json FROM audit_entries ORDER BY id")
+      .all() as { action_json: string }[];
+    const projects = database
+      .prepare(
+        "SELECT id,context_id,name,default_item_status,default_execution_mode FROM projects ORDER BY id",
+      )
+      .all()
+      .map((row) => Object.values(row));
+    const repositories = database
+      .prepare("SELECT id,project_id,name,remote_url,base_branch FROM repositories ORDER BY id")
+      .all()
+      .map((row) => Object.values(row));
+    const repositoryLocations = database
+      .prepare(
+        "SELECT repository_id,machine_id,checkout_path,worktree_root FROM repository_locations ORDER BY repository_id,machine_id",
+      )
+      .all()
+      .map((row) => Object.values(row));
+    const workspaces = database
+      .prepare("SELECT id,item_id,preparation_state FROM workspaces ORDER BY id")
+      .all()
+      .map((row) => Object.values(row));
+    const workspaceRepositories = database
+      .prepare(
+        "SELECT workspace_id,repository_id,branch,base_branch FROM workspace_repositories ORDER BY workspace_id,repository_id",
+      )
+      .all()
+      .map((row) => Object.values(row));
     const metadata = Object.fromEntries(
       [
         "next_context_id",
@@ -283,6 +351,8 @@ describe("Context write transactions", () => {
         "next_audit_id",
         "next_machine_id",
         "next_cli_profile_id",
+        "next_repository_id",
+        "next_workspace_id",
       ].map((key) => [
         key,
         (database.prepare("SELECT value FROM metadata WHERE key=?").get(key) as { value: number })
@@ -292,7 +362,12 @@ describe("Context write transactions", () => {
     expect(contextRow).toEqual(fixture.context);
     expect(projectRow).toEqual(fixture.project);
     expect(attentionRows).toEqual(fixture.attention_defaults);
-    expect(auditRow.action_json).toBe(fixture.audit_action_json);
+    expect(auditRows.map(({ action_json }) => action_json)).toEqual(fixture.audit_action_jsons);
+    expect(projects).toEqual(fixture.projects);
+    expect(repositories).toEqual(fixture.repositories);
+    expect(repositoryLocations).toEqual(fixture.repository_locations);
+    expect(workspaces).toEqual(fixture.workspaces);
+    expect(workspaceRepositories).toEqual(fixture.workspace_repositories);
     expect(metadata).toEqual(fixture.metadata);
     database.close();
     store.close();

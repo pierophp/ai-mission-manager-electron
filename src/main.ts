@@ -132,9 +132,9 @@ if (!hasSingleInstance) {
     try {
       store = openSqliteStore();
       const state = store.loadState();
-      ensureProjectWorkspaces(state);
-      recoverRunStateRecords(state);
       const runtime = new Runtime(store, state);
+      ensureProjectWorkspaces(runtime);
+      recoverRunStateRecords(runtime.snapshot());
       registerIpc(
         createCommandDispatcher({
           ...createReadCommandHandlers(store),
