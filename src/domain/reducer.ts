@@ -365,6 +365,67 @@ export function decide(state: DomainState, event: Event): Decision {
       effects.push({ type: "persist_repository", repository: value, nextRepositoryId });
       break;
     }
+    case "register_repository_at_location": {
+      const name = cleanRepositoryName(event.name);
+      const remoteUrl = event.remoteUrl.trim();
+      const baseBranch = event.baseBranch.trim();
+      const checkoutPath = event.checkoutPath.trim();
+      const worktreeRoot = event.worktreeRoot.trim();
+      if (!remoteUrl) throw new DomainError("a Repository remote URL cannot be blank");
+      if (!baseBranch) throw new DomainError("a Repository base branch cannot be blank");
+      if (!checkoutPath) throw new DomainError("a Repository checkout path cannot be blank");
+      if (!worktreeRoot) throw new DomainError("a Repository Worktree root cannot be blank");
+      project(event.projectId);
+      // ADR-0014 allows another Context to register a shared execution Machine.
+      const machine = next.machines.find((candidate) => candidate.id === event.machineId);
+      if (!machine) throw new DomainError(`Machine ${event.machineId} does not exist`);
+      let current = next.repositories.find(
+        (candidate) => candidate.project_id === event.projectId && candidate.name === name,
+      );
+      let nextRepositoryId = next.next_repository_id;
+      if (current) {
+        if (current.remote_url !== remoteUrl)
+          throw new DomainError(
+            `Repository ${name} in Project ${event.projectId} has a different remote URL`,
+          );
+        if (
+          next.repository_locations.some(
+            (location) =>
+              location.repository_id === current!.id && location.machine_id === event.machineId,
+          )
+        )
+          throw new DomainError(
+            `Repository ${current.id} has already been configured on Machine ${event.machineId}`,
+          );
+        current = { ...current, base_branch: baseBranch };
+        next.repositories = next.repositories.map((candidate) =>
+          candidate.id === current!.id ? current! : candidate,
+        );
+        effects.push({ type: "update_repository", repository: current });
+      } else {
+        const id = next.next_repository_id;
+        nextRepositoryId = id + 1;
+        current = {
+          id,
+          project_id: event.projectId,
+          name,
+          remote_url: remoteUrl,
+          base_branch: baseBranch,
+        };
+        next.next_repository_id = nextRepositoryId;
+        next.repositories.push(current);
+        effects.push({ type: "persist_repository", repository: current, nextRepositoryId });
+      }
+      const location = {
+        repository_id: current.id,
+        machine_id: event.machineId,
+        checkout_path: checkoutPath,
+        worktree_root: worktreeRoot,
+      };
+      next.repository_locations.push(location);
+      effects.push({ type: "update_repository_location", previousMachineId: null, location });
+      break;
+    }
     case "update_repository": {
       const name = cleanRepositoryName(event.name);
       const remoteUrl = event.remoteUrl.trim();
@@ -761,6 +822,89 @@ export function decide(state: DomainState, event: Event): Decision {
         );
       if (complete) workspace.preparation_state = "ready";
       else if (workspace.preparation_state !== "resumable") workspace.preparation_state = "pending";
+      effects.push({ type: "persist_workspace_update", workspace: structuredClone(workspace) });
+      break;
+    }
+    case "create_worktree": {
+      const workspace = next.workspaces.find((candidate) => candidate.id === event.workspaceId);
+      if (!workspace)
+        throw new DomainError(
+          `Project Repository execution setup ${event.workspaceId} does not exist`,
+        );
+      const item = next.items.find((candidate) => candidate.id === workspace.item_id);
+      if (!item) throw new DomainError(`Item ${workspace.item_id} does not exist`);
+      const repository = next.repositories.find((candidate) => candidate.id === event.repositoryId);
+      if (!repository) throw new DomainError(`Repository ${event.repositoryId} does not exist`);
+      if (repository.project_id !== item.project_id)
+        throw new DomainError(
+          `Repository ${event.repositoryId} belongs to another Project than ${item.project_id}`,
+        );
+      if (
+        next.worktrees.some(
+          (candidate) =>
+            candidate.workspaceId === event.workspaceId &&
+            candidate.repositoryId === event.repositoryId,
+        )
+      )
+        throw new DomainError(
+          `Repository ${event.repositoryId} already has a registered Worktree for this Item`,
+        );
+      const machine = next.machines.find((candidate) => candidate.id === event.machineId);
+      if (!machine) throw new DomainError(`Machine ${event.machineId} does not exist`);
+      const itemProject = next.projects.find((candidate) => candidate.id === item.project_id);
+      if (!itemProject) throw new DomainError(`Project ${item.project_id} does not exist`);
+      const context = next.contexts.find((candidate) => candidate.id === itemProject.context_id);
+      if (!context) throw new DomainError(`Context ${itemProject.context_id} does not exist`);
+      if (context.execution_machine_id == null)
+        throw new DomainError(`Context ${context.id} has no execution Machine configured`);
+      if (context.execution_machine_id !== event.machineId)
+        throw new DomainError(
+          `Machine ${event.machineId} is not the execution Machine configured for Context ${context.id}`,
+        );
+      const cleanPath = event.path.trim();
+      const branch = event.branch.trim();
+      const baseBranch = event.baseBranch.trim();
+      if (!cleanPath) throw new DomainError("a Worktree path cannot be blank");
+      if (!branch) throw new DomainError("a branch cannot be blank");
+      if (!baseBranch) throw new DomainError("a base branch cannot be blank");
+      const worktree = {
+        id: next.next_worktree_id,
+        workspaceId: event.workspaceId,
+        repositoryId: event.repositoryId,
+        machineId: event.machineId,
+        path: cleanPath,
+        branch,
+        baseBranch,
+        isDirty: event.isDirty,
+      };
+      next.next_worktree_id += 1;
+      next.worktrees.push(worktree);
+      const allRepositoriesPrepared = next.repositories
+        .filter((candidate) => candidate.project_id === item.project_id)
+        .every((candidate) =>
+          next.worktrees.some(
+            (candidateWorktree) =>
+              candidateWorktree.workspaceId === event.workspaceId &&
+              candidateWorktree.repositoryId === candidate.id,
+          ),
+        );
+      if (
+        allRepositoriesPrepared &&
+        next.repositories.some((candidate) => candidate.project_id === item.project_id)
+      )
+        workspace.preparation_state = "ready";
+      effects.push({ type: "persist_worktree", worktree, nextWorktreeId: next.next_worktree_id });
+      if (workspace.preparation_state === "ready")
+        effects.push({ type: "persist_workspace_update", workspace: structuredClone(workspace) });
+      break;
+    }
+    case "mark_workspace_resumable": {
+      const workspace = next.workspaces.find((candidate) => candidate.id === event.workspaceId);
+      if (!workspace)
+        throw new DomainError(
+          `Project Repository execution setup ${event.workspaceId} does not exist`,
+        );
+      workspace.preparation_state = "resumable";
       effects.push({ type: "persist_workspace_update", workspace: structuredClone(workspace) });
       break;
     }

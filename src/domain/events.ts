@@ -47,6 +47,16 @@ export type Event =
     }
   | { type: "register_repository"; projectId: number; name: string; remoteUrl: string }
   | {
+      type: "register_repository_at_location";
+      projectId: number;
+      name: string;
+      remoteUrl: string;
+      baseBranch: string;
+      machineId: number;
+      checkoutPath: string;
+      worktreeRoot: string;
+    }
+  | {
       type: "update_repository";
       repositoryId: number;
       name: string;
@@ -109,7 +119,18 @@ export type Event =
       type: "set_workspace_repositories";
       workspaceId: number;
       repositories: WorkspaceRepositoryInput[];
-    };
+    }
+  | {
+      type: "create_worktree";
+      workspaceId: number;
+      repositoryId: number;
+      machineId: number;
+      path: string;
+      branch: string;
+      baseBranch: string;
+      isDirty: boolean;
+    }
+  | { type: "mark_workspace_resumable"; workspaceId: number };
 
 export type Effect =
   | { type: "persist_context"; context: Context; nextContextId: number }
@@ -151,6 +172,7 @@ export type Effect =
       nextWorkspaceId: number;
     }
   | { type: "persist_workspace_update"; workspace: DomainState["workspaces"][number] }
+  | { type: "persist_worktree"; worktree: DomainState["worktrees"][number]; nextWorktreeId: number }
   | { type: "persist_item"; item: Item; nextItemId: number; nextItemNumber: number }
   | { type: "persist_item_update"; item: Item }
   | { type: "persist_item_reminders"; item: Item; nextReminderId: number }

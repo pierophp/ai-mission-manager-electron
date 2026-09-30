@@ -299,6 +299,23 @@ export class SqliteStore {
         );
         this.persistWorkspaceRepositories(effect.workspace);
         break;
+      case "persist_worktree":
+        db.prepare(
+          "INSERT INTO worktrees(id,workspace_id,repository_id,machine_id,path,branch,base_branch,is_dirty) VALUES(?,?,?,?,?,?,?,?)",
+        ).run(
+          effect.worktree.id,
+          effect.worktree.workspaceId,
+          effect.worktree.repositoryId,
+          effect.worktree.machineId,
+          effect.worktree.path,
+          effect.worktree.branch,
+          effect.worktree.baseBranch,
+          effect.worktree.isDirty ? 1 : 0,
+        );
+        db.prepare("UPDATE metadata SET value=? WHERE key='next_worktree_id'").run(
+          effect.nextWorktreeId,
+        );
+        break;
       case "persist_item":
         db.prepare(
           "INSERT INTO items(id,human_identifier,title,project_id,status,notes) VALUES(?,?,?,?,?,?)",

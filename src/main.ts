@@ -10,6 +10,7 @@ import { createWorkCommandHandlers } from "./main/work-commands";
 import { Runtime } from "./main/runtime";
 import { openSqliteStore, type SqliteStore } from "./main/persistence/sqlite-store";
 import { ensureProjectWorkspaces, recoverRunStateRecords } from "./main/persistence/startup";
+import { LocalSshMachineAccess } from "./main/machine-access";
 
 const execFileAsync = promisify(execFile);
 const hasSingleInstance = app.requestSingleInstanceLock();
@@ -135,14 +136,15 @@ if (!hasSingleInstance) {
       store = openSqliteStore();
       const state = store.loadState();
       const runtime = new Runtime(store, state);
+      const machineAccess = new LocalSshMachineAccess();
       ensureProjectWorkspaces(runtime);
       recoverRunStateRecords(runtime.snapshot());
       registerIpc(
         createCommandDispatcher({
           ...createReadCommandHandlers(store),
           ...createSetupCommandHandlers(runtime, store),
-          ...createStructureCommandHandlers(runtime, undefined, store),
-          ...createWorkCommandHandlers(runtime),
+          ...createStructureCommandHandlers(runtime, machineAccess, store),
+          ...createWorkCommandHandlers(runtime, machineAccess),
         }),
       );
       mainWindow = createWindow();

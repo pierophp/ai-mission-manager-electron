@@ -19,6 +19,22 @@ import type {
 import { LocalSshMachineAccess, type MachineAccess } from "./machine-access";
 import type { SqliteStore } from "./persistence/sqlite-store";
 import { decide } from "../domain/state-transition";
+import { GitCli } from "./git";
+import { normalizeMachinePath, resolveMachinePath } from "./machine-path";
+
+function repositoryRegistrationContents(state: ReturnType<Runtime["snapshot"]>, projectId: number) {
+  const repositories = state.repositories
+    .filter((repository) => repository.project_id === projectId)
+    .sort((left, right) => left.id - right.id);
+  const repositoryIds = new Set(repositories.map((repository) => repository.id));
+  const locations = state.repository_locations
+    .filter((location) => repositoryIds.has(location.repository_id))
+    .sort(
+      (left, right) =>
+        left.repository_id - right.repository_id || left.machine_id - right.machine_id,
+    );
+  return { repositories, locations };
+}
 
 export function createStructureCommandHandlers(
   runtime: Runtime,
@@ -162,6 +178,75 @@ export function createStructureCommandHandlers(
         },
         runtime.snapshot().next_repository_id,
       ),
+    register_repository_at_location: async (args: Record<string, unknown>): Promise<Repository> => {
+      const state = runtime.snapshot();
+      const projectId = Number(args.projectId);
+      const machineId = Number(args.machineId);
+      const project = state.projects.find((candidate) => candidate.id === projectId);
+      if (!project) throw new Error(`Project ${projectId} does not exist`);
+      const machine = state.machines.find((candidate) => candidate.id === machineId);
+      if (!machine) throw new Error(`Machine ${machineId} does not exist`);
+      const registrationContents = repositoryRegistrationContents(state, projectId);
+      const machineHome = await machineAccess.machineHome(machine);
+      const normalizedCheckoutPath = normalizeMachinePath(
+        String(args.checkoutPath ?? ""),
+        machineHome,
+      );
+      const checkoutPath = resolveMachinePath(normalizedCheckoutPath, machineHome);
+      const rawWorktreeRoot = String(args.worktreeRoot ?? "").trim() || "~/worktrees";
+      const normalizedWorktreeRoot = normalizeMachinePath(rawWorktreeRoot, machineHome);
+      const clone = Boolean(args.cloneIntoDestination);
+      const expectedRemote = args.remoteUrl == null ? null : String(args.remoteUrl);
+      if (clone && !expectedRemote?.trim())
+        throw new Error("A remote URL is required when cloning a Repository");
+      const git = new GitCli(machineAccess);
+      let inspection;
+      if (clone) inspection = await git.cloneRepository(machine, expectedRemote!, checkoutPath);
+      else inspection = await git.adoptRepository(machine, checkoutPath, expectedRemote);
+      const effectiveRemote = expectedRemote?.trim() || inspection.remoteUrl;
+      if (!effectiveRemote) throw new Error("The existing checkout has no Git remote");
+      const repositoryName = String(args.name ?? "");
+      const baseBranch = String(args.baseBranch ?? "");
+      const latest = runtime.snapshot();
+      const latestContents = repositoryRegistrationContents(latest, projectId);
+      const isCurrent =
+        JSON.stringify(latest.projects.find((entry) => entry.id === projectId)) ===
+          JSON.stringify(project) &&
+        JSON.stringify(latest.machines.find((entry) => entry.id === machineId)) ===
+          JSON.stringify(machine) &&
+        JSON.stringify(latestContents.repositories) ===
+          JSON.stringify(registrationContents.repositories) &&
+        JSON.stringify(latestContents.locations) === JSON.stringify(registrationContents.locations);
+      if (!isCurrent) {
+        const error =
+          "The Project, Machine, or Repository registration changed while Git was inspecting the checkout; review it again";
+        throw new Error(
+          clone ? `${error}; the cloned checkout remains at ${normalizedCheckoutPath}` : error,
+        );
+      }
+      try {
+        const result = runtime.dispatch({
+          type: "register_repository_at_location",
+          projectId,
+          name: repositoryName,
+          remoteUrl: effectiveRemote,
+          baseBranch,
+          machineId,
+          checkoutPath: normalizedCheckoutPath,
+          worktreeRoot: normalizedWorktreeRoot,
+        });
+        const registered = result.repositories.find(
+          (entry) => entry.project_id === projectId && entry.name === repositoryName.trim(),
+        );
+        if (!registered) throw new Error("Repository registration produced no Repository");
+        return registered;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        if (clone)
+          throw new Error(`${detail}; the cloned checkout remains at ${normalizedCheckoutPath}`);
+        throw error;
+      }
+    },
     update_repository: (args: Record<string, unknown>) =>
       dispatchAndSelectRepository(
         {
