@@ -6,7 +6,7 @@ import { LocalSshMachineAccess, type MachineAccess } from "./machine-access";
 import { GitCli } from "./git";
 import { normalizeMachinePath, resolveMachinePath, worktreePath } from "./machine-path";
 import { suggestUntrackedRuns } from "../domain/run-suggestions";
-import type { RunSuggestion } from "../domain/execution-types";
+import type { Run, RunSuggestion } from "../domain/execution-types";
 import {
   buildPaneAttachCommand,
   buildTerminalAppleScript,
@@ -17,12 +17,22 @@ import {
   type TerminalRuntime,
 } from "./terminal";
 import type { RunReconciliationResult, MachineObservationFailure } from "../domain/types";
+import type { Machine } from "../domain/types";
 import type {
   TerminalOutputEvent,
   TerminalExitEvent,
   TerminalAttachment,
   PaneTab,
 } from "../domain/terminal-types";
+import type { GrillAnswer, GrillContinuationAction } from "../domain/execution-types";
+import {
+  composeGrillContinuationPrompt,
+  composePlanGoPrompt,
+  formatGrillResponse,
+} from "../domain/grilling";
+import { productSkills } from "./generated-resources";
+import { decide } from "../domain/state-transition";
+import { createRunWorkflowReconciler } from "./run-workflow-reconciliation";
 
 function sameSuggestion(left: RunSuggestion, right: RunSuggestion): boolean {
   return (
@@ -51,6 +61,58 @@ export function createWorkCommandHandlers(
   ) => void = () => undefined,
   onRunQuestionsChanged: (runId: number) => void = () => undefined,
 ) {
+  const grillLocks = new Map<number, Promise<void>>();
+  const withGrillLock = async <T>(runId: number, operation: () => Promise<T>): Promise<T> => {
+    const previous = grillLocks.get(runId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    grillLocks.set(runId, current);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (grillLocks.get(runId) === current) grillLocks.delete(runId);
+    }
+  };
+  const runAndMachine = (runId: number) => {
+    const state = runtime.snapshot();
+    const run = state.runs.find((entry) => entry.id === runId);
+    if (!run) throw new Error(`Run ${runId} does not exist`);
+    const machine = state.machines.find((entry) => entry.id === run.machine_id);
+    if (!machine) throw new Error(`Machine ${run.machine_id} does not exist`);
+    return { state, run, machine };
+  };
+  const reconcileRunWorkflowState = createRunWorkflowReconciler(
+    runtime,
+    terminalRuntime,
+    onRunQuestionsChanged,
+  );
+  const sendRunInstruction = async <T>(
+    run: Run,
+    machine: Machine,
+    prompt: string,
+    staleMessage: string,
+    commit: () => T,
+  ): Promise<T> => {
+    await terminalRuntime.sendPaneInput(
+      machine,
+      run.pane_id,
+      new TextEncoder().encode(`${prompt}\n`),
+    );
+    const latestState = runtime.snapshot();
+    const latest = latestState.runs.find((entry) => entry.id === run.id);
+    if (
+      !latest ||
+      JSON.stringify(latest) !== JSON.stringify(run) ||
+      JSON.stringify(latestState.machines.find((entry) => entry.id === machine.id)) !==
+        JSON.stringify(machine)
+    )
+      throw new Error(staleMessage);
+    return commit();
+  };
   const reconcileRuns = async (): Promise<RunReconciliationResult> => {
     if (!runtime.beginReconciliation()) return { failures: [], changed: false };
     try {
@@ -162,6 +224,21 @@ export function createWorkCommandHandlers(
           changed = true;
           if (liveRun.state !== targetState)
             onRunStateChanged({ runId: run.id, state: targetState });
+        }
+      }
+      for (const run of runtime
+        .snapshot()
+        .runs.filter(
+          (entry) =>
+            ["grill", "plan"].includes(entry.execution_profile) &&
+            ["blocked", "finished"].includes(entry.state),
+        )) {
+        try {
+          await reconcileRunWorkflowState(run.id);
+        } catch (error) {
+          console.error(
+            `Could not capture Grill questions for Run ${run.id}: ${error instanceof Error ? error.message : String(error)}`,
+          );
         }
       }
       return { failures, changed };
@@ -434,6 +511,82 @@ export function createWorkCommandHandlers(
     return worktreeValue(next, workspaceId, repositoryId);
   };
   return {
+    submit_grill_answers: (args: Record<string, unknown>) =>
+      withGrillLock(Number(args.runId), async () => {
+        const runId = Number(args.runId);
+        const { run, machine } = runAndMachine(runId);
+        if (run.execution_profile !== "grill") throw new Error(`Run ${runId} is not a Grill Run`);
+        if (
+          !(
+            run.state === "blocked" ||
+            (run.state === "finished" && run.grill_phase === "waitingForAnswers")
+          )
+        )
+          throw new Error(`Run ${runId} is not waiting for Grill answers`);
+        const answers = args.answers as GrillAnswer[];
+        const answered = runtime
+          .dispatch({ type: "record_grill_answers", runId, answers })
+          .runs.find((entry) => entry.id === runId);
+        if (!answered) throw new Error(`Run ${runId} does not exist`);
+        const response = formatGrillResponse(answered.grill_answers);
+        await terminalRuntime.sendPaneInput(
+          machine,
+          run.pane_id,
+          new TextEncoder().encode(`${response}\n`),
+        );
+        const latest = runtime.snapshot().runs.find((entry) => entry.id === runId);
+        if (!latest || latest.machine_id !== run.machine_id || latest.pane_id !== run.pane_id)
+          throw new Error(
+            `Run ${runId} changed while its Grill response was being sent; the response may already have reached the agent`,
+          );
+        runtime.dispatch({ type: "set_run_state", runId, state: "working" });
+        const updated = runtime
+          .dispatch({ type: "record_grill_response", runId, response })
+          .runs.find((entry) => entry.id === runId);
+        if (!updated) throw new Error(`Run ${runId} does not exist`);
+        return updated;
+      }),
+    continue_grill: (args: Record<string, unknown>) =>
+      withGrillLock(Number(args.runId), async () => {
+        const runId = Number(args.runId);
+        const action = String(args.action) as GrillContinuationAction;
+        if (!["to-spec", "to-tickets", "implement"].includes(action))
+          throw new Error("Invalid Grill continuation action");
+        const { state, run, machine } = runAndMachine(runId);
+        const prompt = composeGrillContinuationPrompt(state, runId, action, {
+          "to-spec": productSkills["to-spec"],
+          "to-tickets": productSkills["to-tickets"],
+          implement: productSkills.implement,
+        });
+        const startedAt = Math.floor(Date.now() / 1000);
+        decide(state, { type: "continue_grill", runId, action, startedAt });
+        return sendRunInstruction(
+          run,
+          machine,
+          prompt,
+          `Run ${runId} changed while its Grill continuation was being sent; the continuation may already have reached the agent`,
+          () =>
+            runtime
+              .dispatch({ type: "continue_grill", runId, action, startedAt })
+              .runs.find((entry) => entry.id === runId)!,
+        );
+      }),
+    go_plan: (args: Record<string, unknown>) =>
+      withGrillLock(Number(args.runId), async () => {
+        const runId = Number(args.runId);
+        const { run, machine } = runAndMachine(runId);
+        const prompt = composePlanGoPrompt(run);
+        const initial = runtime.snapshot();
+        decide(initial, { type: "go_plan", runId });
+        return sendRunInstruction(
+          run,
+          machine,
+          prompt,
+          `Run ${runId} changed while Go was being sent; the instruction may already have reached the agent`,
+          () =>
+            runtime.dispatch({ type: "go_plan", runId }).runs.find((entry) => entry.id === runId)!,
+        );
+      }),
     reconcile_runs: reconcileRuns,
     list_run_suggestions: async (): Promise<RunSuggestion[]> => {
       const snapshot = runtime.snapshot();
@@ -763,6 +916,11 @@ export function createWorkCommandHandlers(
         currentCommand: pane.currentCommand,
         currentPath: pane.currentPath,
       }));
+      await reconcileRunWorkflowState(runId).catch((error) =>
+        console.error(
+          `Could not capture Grill questions for Run ${runId}: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
       return { terminalId, generation, sessionName, paneId, snapshot: [...snapshot], panes: tabs };
     },
     terminal_input: async (args: Record<string, unknown>) => {

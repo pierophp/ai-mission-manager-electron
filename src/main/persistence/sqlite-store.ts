@@ -286,13 +286,21 @@ export class SqliteStore {
         break;
       case "persist_run_observation":
         db.prepare(
-          "UPDATE runs SET state=?,last_applied_agent_state_sequence=?,pane_status=?,grill_phase=?,plan_phase=? WHERE id=?",
+          "UPDATE runs SET state=?,last_applied_agent_state_sequence=?,pane_status=?,grill_phase=?,plan_phase=?,transcript=?,grill_question_group_json=?,grill_answers_json=?,grill_decisions_json=?,grill_response=?,grill_action=?,grill_action_started_at=?,plan_path=? WHERE id=?",
         ).run(
           effect.run.state,
           effect.run.last_applied_agent_state_sequence ?? null,
           effect.run.pane_status,
           encodeGrillPhase(effect.run.grill_phase ?? null),
           encodePlanPhase(effect.run.plan_phase ?? null),
+          effect.run.transcript,
+          effect.run.grill_question_group ? JSON.stringify(effect.run.grill_question_group) : null,
+          JSON.stringify(effect.run.grill_answers),
+          JSON.stringify(effect.run.grill_decisions),
+          effect.run.grill_response,
+          effect.run.grill_action,
+          effect.run.grill_action_started_at ?? null,
+          effect.run.plan_path,
           effect.run.id,
         );
         break;

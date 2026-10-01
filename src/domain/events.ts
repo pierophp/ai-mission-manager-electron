@@ -120,6 +120,33 @@ export type Event =
       paneStatus: import("./execution-types").RunPaneStatus;
     }
   | {
+      type: "continue_grill";
+      runId: number;
+      action: import("./execution-types").GrillContinuationAction;
+      startedAt: number;
+    }
+  | { type: "set_run_state"; runId: number; state: import("./execution-types").RunState }
+  | {
+      type: "record_grill_answers";
+      runId: number;
+      answers: import("./execution-types").GrillAnswer[];
+    }
+  | { type: "record_grill_response"; runId: number; response: string }
+  | {
+      type: "record_run_transcript";
+      runId: number;
+      transcript: string;
+      questionGroup: import("./execution-types").GrillQuestionGroup | null;
+    }
+  | { type: "record_run_plan"; runId: number; path: string }
+  | { type: "go_plan"; runId: number }
+  | {
+      type: "capture_downstream_issues";
+      runId: number;
+      action: import("./execution-types").GrillContinuationAction;
+      issues: import("./grilling").ConfirmedDownstreamIssue[];
+    }
+  | {
       type: "attach_untracked_run";
       itemId: number;
       workspaceId: number;

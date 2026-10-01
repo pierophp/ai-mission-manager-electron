@@ -1,4 +1,5 @@
 import { DomainError } from "./error";
+import { formatGrillResponse, grillContinuationAvailable } from "./grilling";
 import { defaultPstackRoles, type DomainState } from "./model";
 import { cleanMachineTransport } from "./machine-transport";
 import { pathIsWithin } from "./paths";
@@ -20,6 +21,19 @@ import {
   planRepositoryDeletion,
   parentSelectionMatches,
 } from "./deletion";
+
+function supportsLinkPurpose(
+  object: DomainState["external_objects"][number],
+  purpose: "to-spec" | "to-tickets",
+): boolean {
+  if (object.provider === "generic" && object.external_key.startsWith("local:")) return true;
+  if (object.provider === "github") return object.kind === "issue";
+  if (object.provider === "atlassian")
+    return purpose === "to-spec"
+      ? object.kind === "issue" || object.kind === "document"
+      : object.kind === "issue";
+  return false;
+}
 
 function workspacePreparationState(
   state: DomainState,
@@ -889,6 +903,219 @@ export function decide(state: DomainState, event: Event): Decision {
       }
       break;
     }
+    case "continue_grill": {
+      const run = next.runs.find((candidate) => candidate.id === event.runId);
+      if (!run) throw new DomainError(`Run ${event.runId} does not exist`);
+      if (
+        run.execution_profile !== "grill" ||
+        !grillContinuationAvailable(run.grill_phase, run.grill_action, event.action) ||
+        run.pane_status !== "available"
+      )
+        throw new DomainError(
+          `Run ${event.runId} cannot continue Grill from phase ${run.grill_phase ?? "None"}`,
+        );
+      run.state = "working";
+      run.grill_phase = "working";
+      run.grill_question_group = null;
+      run.grill_answers = [];
+      run.grill_response = null;
+      run.grill_action = event.action;
+      run.grill_action_started_at = event.startedAt;
+      effects.push({ type: "persist_run_observation", run: structuredClone(run) });
+      break;
+    }
+    case "set_run_state": {
+      const run = next.runs.find((candidate) => candidate.id === event.runId);
+      if (!run) throw new DomainError(`Run ${event.runId} does not exist`);
+      run.state = event.state;
+      if (run.execution_profile === "grill")
+        run.grill_phase = event.state === "working" ? "working" : run.grill_phase;
+      if (
+        run.execution_profile === "plan" &&
+        event.state === "working" &&
+        run.plan_phase !== "executing"
+      )
+        run.plan_phase = null;
+      effects.push({ type: "persist_run_observation", run: structuredClone(run) });
+      break;
+    }
+    case "record_run_transcript": {
+      const run = next.runs.find((candidate) => candidate.id === event.runId);
+      if (!run) throw new DomainError(`Run ${event.runId} does not exist`);
+      if (run.execution_profile !== "grill")
+        throw new DomainError(`Run ${event.runId} is not a Grill Run`);
+      const hasQuestions =
+        event.questionGroup !== null &&
+        (run.grill_response === null ||
+          JSON.stringify(run.grill_question_group) !== JSON.stringify(event.questionGroup));
+      run.transcript = event.transcript;
+      if (JSON.stringify(run.grill_question_group) !== JSON.stringify(event.questionGroup)) {
+        run.grill_answers = [];
+        run.grill_response = null;
+        run.grill_question_group = structuredClone(event.questionGroup);
+      }
+      if (run.state === "finished" && run.grill_phase !== "finished")
+        run.grill_phase = hasQuestions ? "waitingForAnswers" : "awaitingNextAction";
+      effects.push({ type: "persist_run_observation", run: structuredClone(run) });
+      break;
+    }
+    case "record_grill_answers": {
+      const run = next.runs.find((candidate) => candidate.id === event.runId);
+      if (!run) throw new DomainError(`Run ${event.runId} does not exist`);
+      if (run.execution_profile !== "grill")
+        throw new DomainError(`Run ${event.runId} is not a Grill Run`);
+      if (run.grill_response !== null)
+        throw new DomainError(`Run ${event.runId} already has a submitted Grill response`);
+      const group = run.grill_question_group;
+      if (!group) throw new DomainError(`Run ${event.runId} has no parsed Grill question group`);
+      const answers = [...event.answers].sort((a, b) => a.questionNumber - b.questionNumber);
+      if (answers.length !== group.questions.length)
+        throw new DomainError(`Run ${event.runId} has no parsed Grill question group`);
+      const unknown = answers.find(
+        (answer) => !group.questions.some((question) => question.number === answer.questionNumber),
+      );
+      if (unknown)
+        throw new DomainError(`Grill answer is for unknown question ${unknown.questionNumber}`);
+      formatGrillResponse(answers);
+      run.grill_decisions.push(...structuredClone(answers));
+      run.grill_answers = answers;
+      effects.push({ type: "persist_run_observation", run: structuredClone(run) });
+      break;
+    }
+    case "record_grill_response": {
+      const run = next.runs.find((candidate) => candidate.id === event.runId);
+      if (!run) throw new DomainError(`Run ${event.runId} does not exist`);
+      if (run.execution_profile !== "grill")
+        throw new DomainError(`Run ${event.runId} is not a Grill Run`);
+      if (!run.grill_answers.length) throw new DomainError("a Grill answer cannot be blank");
+      if (!event.response.trim()) throw new DomainError("a Grill response cannot be blank");
+      run.grill_response = event.response.trim();
+      effects.push({ type: "persist_run_observation", run: structuredClone(run) });
+      break;
+    }
+    case "record_run_plan": {
+      const run = next.runs.find((candidate) => candidate.id === event.runId);
+      if (!run) throw new DomainError(`Run ${event.runId} does not exist`);
+      if (run.execution_profile !== "plan" || run.workflow !== "pstack")
+        throw new DomainError(`Run ${event.runId} is not a pstack Run`);
+      const path = event.path.trim();
+      if (path && path !== run.plan_path) {
+        run.plan_path = path;
+        effects.push({ type: "persist_run_observation", run: structuredClone(run) });
+      }
+      break;
+    }
+    case "go_plan": {
+      const run = next.runs.find((candidate) => candidate.id === event.runId);
+      if (!run) throw new DomainError(`Run ${event.runId} does not exist`);
+      if (
+        run.execution_profile !== "plan" ||
+        run.workflow !== "pstack" ||
+        run.state !== "finished" ||
+        run.plan_phase !== "awaitingGo" ||
+        run.pane_status !== "available"
+      )
+        throw new DomainError(`Run ${event.runId} is not awaiting Go or its Pane is unavailable`);
+      run.state = "working";
+      run.plan_phase = "executing";
+      effects.push({ type: "persist_run_observation", run: structuredClone(run) });
+      break;
+    }
+    case "capture_downstream_issues": {
+      const run = next.runs.find((candidate) => candidate.id === event.runId);
+      if (!run) throw new DomainError(`Run ${event.runId} does not exist`);
+      if (
+        run.execution_profile !== "grill" ||
+        run.grill_action !== event.action ||
+        !["to-spec", "to-tickets"].includes(event.action)
+      )
+        throw new DomainError(
+          `Run ${event.runId} cannot capture downstream Issues for action ${event.action}`,
+        );
+      for (const issue of event.issues) {
+        if (
+          (issue.object.provider === "generic" &&
+            !issue.object.external_key.startsWith("local:")) ||
+          !issue.object.external_key.trim() ||
+          !issue.object.canonical_url.trim()
+        )
+          continue;
+        let object = next.external_objects.find(
+          (candidate) =>
+            candidate.provider === issue.object.provider &&
+            candidate.external_key === issue.object.external_key,
+        );
+        if (!object) {
+          object = { ...issue.object, id: next.next_external_object_id++ };
+          next.external_objects.push(object);
+          effects.push({
+            type: "persist_external_object",
+            object,
+            nextExternalObjectId: next.next_external_object_id,
+          });
+        }
+        let link = next.links.find(
+          (candidate) =>
+            candidate.item_id === run.item_id && candidate.external_object_id === object!.id,
+        );
+        const existingLink = link !== undefined;
+        const previousLink = link ? structuredClone(link) : null;
+        if (!link) {
+          link = {
+            id: next.next_link_id++,
+            item_id: run.item_id,
+            external_object_id: object.id,
+            reviewed_activity_id: 0,
+            attention_policy: null,
+            watch_until: null,
+            review_at: null,
+            purpose: "others",
+            spec_external_object_id: null,
+            provenance: null,
+          };
+          next.links.push(link);
+        }
+        link.provenance = {
+          run_id: run.id,
+          action: event.action,
+          discovery: issue.discovery,
+          ordinal: issue.ordinal,
+          blocked_by: issue.blockedBy,
+        };
+        const isSpec = event.action === "to-spec" && supportsLinkPurpose(object, "to-spec");
+        const isTicket = event.action === "to-tickets" && supportsLinkPurpose(object, "to-tickets");
+        link.purpose = isSpec ? "to-spec" : isTicket ? "to-tickets" : "others";
+        link.spec_external_object_id = isTicket
+          ? (next.links.find(
+              (candidate) => candidate.item_id === run.item_id && candidate.purpose === "to-spec",
+            )?.external_object_id ?? null)
+          : null;
+        if (!existingLink || JSON.stringify(previousLink) !== JSON.stringify(link)) {
+          effects.push(
+            existingLink
+              ? { type: "persist_link_state", link: structuredClone(link) }
+              : {
+                  type: "persist_external_link",
+                  link: structuredClone(link),
+                  nextLinkId: next.next_link_id,
+                },
+          );
+        }
+        const snapshot = { external_object_id: object.id, ...issue.snapshot };
+        const snapshotIndex = next.snapshots.findIndex(
+          (candidate) => candidate.external_object_id === object!.id,
+        );
+        if (
+          snapshotIndex < 0 ||
+          JSON.stringify(next.snapshots[snapshotIndex]) !== JSON.stringify(snapshot)
+        ) {
+          if (snapshotIndex < 0) next.snapshots.push(snapshot);
+          else next.snapshots[snapshotIndex] = snapshot;
+          effects.push({ type: "persist_external_snapshot", snapshot });
+        }
+      }
+      break;
+    }
     case "attach_untracked_run": {
       const item = next.items.find((entry) => entry.id === event.itemId);
       if (!item) throw new DomainError(`Item ${event.itemId} does not exist`);
@@ -1428,19 +1655,10 @@ export function decide(state: DomainState, event: Event): Decision {
       );
       if (!object)
         throw new DomainError(`External Object ${link.external_object_id} does not exist`);
-      const isLocal = object.provider === "generic" && object.external_key.startsWith("local:");
-      const supportsSpec =
-        isLocal ||
-        (object.provider === "github" && object.kind === "issue") ||
-        (object.provider === "atlassian" && ["issue", "document"].includes(object.kind));
-      const supportsTicket =
-        isLocal ||
-        (object.provider === "github" && object.kind === "issue") ||
-        (object.provider === "atlassian" && object.kind === "issue");
-      if (event.purpose === "to-spec" && !supportsSpec)
+      if (event.purpose === "to-spec" && !supportsLinkPurpose(object, "to-spec"))
         throw new DomainError("This External Object cannot have the Spec Link purpose");
       if (event.purpose === "to-tickets") {
-        if (!supportsTicket)
+        if (!supportsLinkPurpose(object, "to-tickets"))
           throw new DomainError("This External Object cannot have the Tickets Link purpose");
         if (event.specExternalObjectId !== null) {
           const specLink = next.links.find(

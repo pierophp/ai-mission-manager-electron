@@ -1,8 +1,9 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
+import { copyFileSync, readFileSync } from "node:fs";
 import { createCommandDispatcher, invokeEnvelope } from "../shared/ipc";
 import { Runtime } from "./runtime";
 import { createWorkCommandHandlers } from "./work-commands";
@@ -15,6 +16,323 @@ afterEach(() => {
 });
 
 describe("Item, Home and search commands", () => {
+  it("submits one complete Grill answer set through the Pane and persists its response", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "mission-manager-grill-"));
+    directories.push(directory);
+    const file = path.join(directory, "mission-manager.sqlite");
+    copyFileSync(path.join(__dirname, "persistence/fixtures/rust-persistence.sqlite"), file);
+    const store = openSqliteStore(file);
+    const initial = JSON.parse(
+      readFileSync("src/main/persistence/fixtures/domain-state.json", "utf8"),
+    ) as import("../domain/model").DomainState;
+    const run = structuredClone(initial.runs[0]!);
+    run.execution_profile = "grill";
+    run.state = "finished";
+    run.grill_phase = "waitingForAnswers";
+    run.grill_answers = [];
+    run.grill_decisions = [];
+    run.grill_response = null;
+    run.worktree_id = null;
+    initial.runs[0] = run;
+    const runtime = new Runtime(store, initial);
+    const { FakeTerminalRuntime } = await import("./terminal");
+    const terminal = new FakeTerminalRuntime();
+    const dispatch = createCommandDispatcher(
+      createWorkCommandHandlers(runtime, undefined, terminal),
+    );
+
+    let release!: () => void;
+    terminal.gates.set(
+      run.machine_id,
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    const request = { runId: run.id, answers: [{ questionNumber: 1, answer: "Keep it" }] };
+    const first = invokeEnvelope(dispatch, "submit_grill_answers", request);
+    while (!terminal.calls.some((call) => call.operation === "send-keys"))
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = invokeEnvelope(dispatch, "submit_grill_answers", request);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(terminal.calls.filter((call) => call.operation === "send-keys")).toHaveLength(1);
+    release();
+    const submitted = (await first) as import("../domain/execution-types").Run;
+    expect(submitted).toMatchObject({
+      state: "working",
+      grill_phase: "working",
+      grill_response: "1. Keep it",
+      grill_decisions: [{ questionNumber: 1, answer: "Keep it" }],
+    });
+    expect(store.loadState().runs[0]).toMatchObject({
+      grill_phase: "working",
+      grill_response: "1. Keep it",
+      grill_answers: [{ questionNumber: 1, answer: "Keep it" }],
+    });
+    await expect(second).rejects.toBe(`Run ${run.id} is not waiting for Grill answers`);
+    expect(terminal.calls.filter((call) => call.operation === "send-keys")).toHaveLength(1);
+    store.close();
+  });
+
+  it("continues a Grill Run through its serialized Run command", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "mission-manager-grill-continue-"));
+    directories.push(directory);
+    const file = path.join(directory, "mission-manager.sqlite");
+    copyFileSync(path.join(__dirname, "persistence/fixtures/rust-persistence.sqlite"), file);
+    const store = openSqliteStore(file);
+    const initial = JSON.parse(
+      readFileSync("src/main/persistence/fixtures/domain-state.json", "utf8"),
+    ) as import("../domain/model").DomainState;
+    const run = initial.runs[0]!;
+    run.execution_profile = "grill";
+    run.state = "finished";
+    run.grill_phase = "awaitingNextAction";
+    run.grill_question_group = null;
+    run.grill_answers = [];
+    run.grill_response = null;
+    run.grill_action = null;
+    run.worktree_id = null;
+    const runtime = new Runtime(store, initial);
+    const { FakeTerminalRuntime } = await import("./terminal");
+    const terminal = new FakeTerminalRuntime();
+    const dispatch = createCommandDispatcher(
+      createWorkCommandHandlers(runtime, undefined, terminal),
+    );
+
+    const continued = (await invokeEnvelope(dispatch, "continue_grill", {
+      runId: run.id,
+      action: "to-spec",
+    })) as import("../domain/execution-types").Run;
+    expect(terminal.calls.filter((call) => call.operation === "send-keys")).toHaveLength(1);
+    expect(continued).toMatchObject({
+      state: "working",
+      grill_phase: "working",
+      grill_action: "to-spec",
+    });
+    expect(continued.grill_action_started_at).toEqual(expect.any(Number));
+    store.close();
+  });
+
+  it("serializes concurrent Grill continuations so the Pane only receives one", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "mission-manager-grill-continue-race-"));
+    directories.push(directory);
+    const file = path.join(directory, "mission-manager.sqlite");
+    copyFileSync(path.join(__dirname, "persistence/fixtures/rust-persistence.sqlite"), file);
+    const store = openSqliteStore(file);
+    const initial = JSON.parse(
+      readFileSync("src/main/persistence/fixtures/domain-state.json", "utf8"),
+    ) as import("../domain/model").DomainState;
+    const run = initial.runs[0]!;
+    run.execution_profile = "grill";
+    run.state = "finished";
+    run.grill_phase = "awaitingNextAction";
+    run.grill_question_group = null;
+    run.grill_answers = [];
+    run.grill_response = null;
+    run.grill_action = null;
+    run.worktree_id = null;
+    const runtime = new Runtime(store, initial);
+    const { FakeTerminalRuntime } = await import("./terminal");
+    const terminal = new FakeTerminalRuntime();
+    const dispatch = createCommandDispatcher(
+      createWorkCommandHandlers(runtime, undefined, terminal),
+    );
+    let release!: () => void;
+    terminal.gates.set(
+      run.machine_id,
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    const request = { runId: run.id, action: "to-spec" };
+    const first = invokeEnvelope(dispatch, "continue_grill", request);
+    while (!terminal.calls.some((call) => call.operation === "send-keys"))
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = invokeEnvelope(dispatch, "continue_grill", request);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(terminal.calls.filter((call) => call.operation === "send-keys")).toHaveLength(1);
+
+    release();
+    await expect(first).resolves.toMatchObject({
+      state: "working",
+      grill_phase: "working",
+      grill_action: "to-spec",
+    });
+    await expect(second).rejects.toThrow();
+    expect(terminal.calls.filter((call) => call.operation === "send-keys")).toHaveLength(1);
+    store.close();
+  });
+
+  it("sends Go for an approved Plan Run and persists the executing phase", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "mission-manager-plan-go-"));
+    directories.push(directory);
+    const file = path.join(directory, "mission-manager.sqlite");
+    copyFileSync(path.join(__dirname, "persistence/fixtures/rust-persistence.sqlite"), file);
+    const store = openSqliteStore(file);
+    const initial = JSON.parse(
+      readFileSync("src/main/persistence/fixtures/domain-state.json", "utf8"),
+    ) as import("../domain/model").DomainState;
+    const run = initial.runs[0]!;
+    run.execution_profile = "plan";
+    run.workflow = "pstack";
+    run.state = "finished";
+    run.plan_phase = "awaitingGo";
+    run.plan_path = "/tmp/approved-plan.md";
+    run.pane_status = "available";
+    run.worktree_id = null;
+    const runtime = new Runtime(store, initial);
+    const { FakeTerminalRuntime } = await import("./terminal");
+    const terminal = new FakeTerminalRuntime();
+    const dispatch = createCommandDispatcher(
+      createWorkCommandHandlers(runtime, undefined, terminal),
+    );
+
+    const started = (await invokeEnvelope(dispatch, "go_plan", {
+      runId: run.id,
+    })) as import("../domain/execution-types").Run;
+
+    expect(terminal.calls.filter((call) => call.operation === "send-keys")).toHaveLength(1);
+    expect(started).toMatchObject({ state: "working", plan_phase: "executing" });
+    expect(store.loadState().runs[0]).toMatchObject({
+      state: "working",
+      plan_phase: "executing",
+      plan_path: "/tmp/approved-plan.md",
+    });
+    store.close();
+  });
+
+  it("captures a Grill-created local Markdown Spec and persists its provenance", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "mission-manager-grill-capture-"));
+    directories.push(directory);
+    const checkout = path.join(directory, "checkout");
+    mkdirSync(path.join(checkout, ".scratch"), { recursive: true });
+    writeFileSync(path.join(checkout, ".scratch/spec.md"), "# Captured Spec\n\nDetails.\n");
+    const file = path.join(directory, "mission-manager.sqlite");
+    copyFileSync(path.join(__dirname, "persistence/fixtures/rust-persistence.sqlite"), file);
+    const store = openSqliteStore(file);
+    const initial = JSON.parse(
+      readFileSync("src/main/persistence/fixtures/domain-state.json", "utf8"),
+    ) as import("../domain/model").DomainState;
+    initial.external_objects = [];
+    initial.links = [];
+    initial.snapshots = [];
+    initial.next_external_object_id = 1;
+    initial.next_link_id = 1;
+    const raw = new DatabaseSync(file);
+    raw.exec(
+      "DELETE FROM external_snapshots; DELETE FROM external_links; DELETE FROM external_objects",
+    );
+    raw.close();
+    const run = initial.runs[0]!;
+    run.execution_profile = "grill";
+    run.state = "finished";
+    run.grill_phase = "awaitingNextAction";
+    run.grill_action = "to-spec";
+    run.grill_action_started_at = null;
+    run.pane_status = "available";
+    run.worktree_id = null;
+    initial.contexts[0]!.execution_machine_id = run.machine_id;
+    initial.repository_locations[0]!.checkout_path = checkout;
+    const runtime = new Runtime(store, initial);
+    const { FakeTerminalRuntime } = await import("./terminal");
+    const terminal = new FakeTerminalRuntime();
+    terminal.panes.set(run.machine_id, [
+      { sessionName: run.session_name, paneId: run.pane_id, agentState: null },
+    ]);
+    terminal.transcripts.set(
+      `${run.machine_id}:${run.pane_id}`,
+      `AI_MISSION_MANAGER_EVENT {"event":"external.object.created","url":".scratch/spec.md","run_id":${run.id},"action":"to-spec"}`,
+    );
+    const dispatch = createCommandDispatcher(
+      createWorkCommandHandlers(runtime, undefined, terminal),
+    );
+
+    await invokeEnvelope(dispatch, "reconcile_runs", {});
+
+    expect(runtime.snapshot().external_objects).toHaveLength(1);
+    expect(runtime.snapshot().external_objects[0]).toMatchObject({
+      provider: "generic",
+      external_key: "local:1#.scratch/spec.md",
+    });
+    expect(runtime.snapshot().links[0]).toMatchObject({
+      item_id: run.item_id,
+      purpose: "to-spec",
+      provenance: {
+        run_id: run.id,
+        action: "to-spec",
+        discovery: "structured-event",
+      },
+    });
+    expect(store.loadState().links[0]).toMatchObject({
+      purpose: "to-spec",
+      provenance: { run_id: run.id, action: "to-spec" },
+    });
+    store.close();
+  });
+
+  it("resolves a Worktree Run's local Markdown Spec against the registered checkout", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "mission-manager-grill-worktree-capture-"));
+    directories.push(directory);
+    const checkout = path.join(directory, "checkout");
+    const worktree = path.join(directory, "worktree");
+    mkdirSync(path.join(checkout, ".scratch"), { recursive: true });
+    mkdirSync(path.join(worktree, ".scratch"), { recursive: true });
+    writeFileSync(path.join(checkout, ".scratch/spec.md"), "# Registered Checkout Spec\n");
+    writeFileSync(path.join(worktree, ".scratch/spec.md"), "# Worktree Copy\n");
+    const file = path.join(directory, "mission-manager.sqlite");
+    copyFileSync(path.join(__dirname, "persistence/fixtures/rust-persistence.sqlite"), file);
+    const store = openSqliteStore(file);
+    const initial = JSON.parse(
+      readFileSync("src/main/persistence/fixtures/domain-state.json", "utf8"),
+    ) as import("../domain/model").DomainState;
+    initial.external_objects = [];
+    initial.links = [];
+    initial.snapshots = [];
+    initial.next_external_object_id = 1;
+    initial.next_link_id = 1;
+    const raw = new DatabaseSync(file);
+    raw.exec(
+      "DELETE FROM external_snapshots; DELETE FROM external_links; DELETE FROM external_objects",
+    );
+    raw.close();
+    const run = initial.runs[0]!;
+    run.execution_profile = "grill";
+    run.state = "finished";
+    run.grill_phase = "awaitingNextAction";
+    run.grill_action = "to-spec";
+    run.grill_action_started_at = null;
+    run.pane_status = "available";
+    run.direct_checkouts = [];
+    run.worktree_id = 99;
+    run.working_directory = worktree;
+    initial.contexts[0]!.execution_machine_id = run.machine_id;
+    initial.repository_locations[0]!.checkout_path = checkout;
+    initial.repository_locations[0]!.worktree_root = worktree;
+    const runtime = new Runtime(store, initial);
+    const { FakeTerminalRuntime } = await import("./terminal");
+    const terminal = new FakeTerminalRuntime();
+    terminal.panes.set(run.machine_id, [
+      { sessionName: run.session_name, paneId: run.pane_id, agentState: null },
+    ]);
+    terminal.transcripts.set(
+      `${run.machine_id}:${run.pane_id}`,
+      `AI_MISSION_MANAGER_EVENT {"event":"external.object.created","url":".scratch/spec.md","run_id":${run.id},"action":"to-spec"}`,
+    );
+    const dispatch = createCommandDispatcher(
+      createWorkCommandHandlers(runtime, undefined, terminal),
+    );
+
+    await invokeEnvelope(dispatch, "reconcile_runs", {});
+
+    expect(runtime.snapshot().external_objects[0]).toMatchObject({
+      provider: "generic",
+      external_key: "local:1#.scratch/spec.md",
+      canonical_url: expect.stringContaining(checkout),
+    });
+    expect(runtime.snapshot().snapshots[0]).toMatchObject({ title: "Registered Checkout Spec" });
+    expect(runtime.snapshot().snapshots[0]?.title).not.toBe("Worktree Copy");
+    store.close();
+  });
+
   it("dispatches compatible commands and persists Items, title, reminders and relation casing", async () => {
     const directory = mkdtempSync(path.join(tmpdir(), "mission-manager-items-"));
     directories.push(directory);

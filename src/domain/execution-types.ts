@@ -118,6 +118,7 @@ export type Run = {
   grill_response: string | null;
   grill_phase: GrillPhase | null;
   grill_action: GrillContinuationAction | null;
+  grill_action_started_at?: number | null;
   plan_phase: PlanPhase | null;
   plan_path: string | null;
   implementation_queue_id?: number | null;
