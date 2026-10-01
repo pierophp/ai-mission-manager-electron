@@ -16,6 +16,7 @@ import { LocalSshMachineAccess } from "./main/machine-access";
 import { TmuxTerminalRuntime } from "./main/terminal";
 import { createRunLaunchHandlers } from "./main/run-launcher";
 import { createMachineDeletionHandlers } from "./main/machine-deletion";
+import { createPlanUsageCommandHandlers } from "./main/plan-usage";
 
 const execFileAsync = promisify(execFile);
 const hasSingleInstance = app.requestSingleInstanceLock();
@@ -152,6 +153,7 @@ if (!hasSingleInstance) {
       registerIpc(
         createCommandDispatcher({
           ...createReadCommandHandlers(store),
+          ...createPlanUsageCommandHandlers(runtime, store, machineAccess),
           ...createSetupCommandHandlers(runtime, store),
           ...createStructureCommandHandlers(runtime, machineAccess, store),
           ...createWorkCommandHandlers(

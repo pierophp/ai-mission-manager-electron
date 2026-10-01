@@ -1,0 +1,1 @@
+{"models":[{"slug":"gpt-test","display_name":"GPT Test","visibility":"listable","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}],"default_reasoning_level":"high"},{"slug":"hidden","display_name":"Hidden","visibility":"hidden","supported_reasoning_levels":[{"effort":"low"}],"default_reasoning_level":"low"}]}

@@ -1,0 +1,1 @@
+Usage: claude [options]\n  --effort <level> (low, medium, high, max)\n
