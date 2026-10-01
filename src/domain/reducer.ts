@@ -11,6 +11,13 @@ import type {
   Machine,
 } from "./types";
 import type { Decision, Effect, Event } from "./events";
+import {
+  planExternalObjectDeletion,
+  planItemDeletion,
+  planParentDeletion,
+  planRepositoryDeletion,
+  parentSelectionMatches,
+} from "./deletion";
 
 export function decide(state: DomainState, event: Event): Decision {
   const next = structuredClone(state);
@@ -1090,6 +1097,393 @@ export function decide(state: DomainState, event: Event): Decision {
         .filter((activity) => activity.external_object_id === link.external_object_id)
         .reduce((id, activity) => Math.max(id, activity.id), link.reviewed_activity_id);
       effects.push({ type: "persist_link_state", link: structuredClone(link) });
+      break;
+    }
+    case "delete_repository": {
+      const plan = planRepositoryDeletion(next, event.repositoryId);
+      if (
+        !parentSelectionMatches(
+          plan.workspaces.map((entry) => entry.id),
+          event.workspaceIds,
+        )
+      )
+        throw new DomainError(
+          `Repository ${event.repositoryId} Workspaces do not match the deletion preview`,
+        );
+      const run = next.runs.find(
+        (candidate) =>
+          candidate.repository_id === event.repositoryId ||
+          candidate.direct_checkouts.some(
+            (checkout) => checkout.repositoryId === event.repositoryId,
+          ) ||
+          (candidate.worktree_id !== null &&
+            next.worktrees.some(
+              (tree) =>
+                tree.id === candidate.worktree_id && tree.repositoryId === event.repositoryId,
+            )),
+      );
+      if (run) throw new DomainError(`Repository ${event.repositoryId} is used by Run ${run.id}`);
+      next.repositories = next.repositories.filter((entry) => entry.id !== event.repositoryId);
+      next.repository_locations = next.repository_locations.filter(
+        (entry) => entry.repository_id !== event.repositoryId,
+      );
+      const affectedIds = plan.workspaces.map((entry) => entry.id);
+      const removedWorktreeIds = next.worktrees
+        .filter(
+          (entry) =>
+            affectedIds.includes(entry.workspaceId) && entry.repositoryId === event.repositoryId,
+        )
+        .map(({ id }) => id);
+      next.worktrees = next.worktrees.filter(
+        (entry) =>
+          !(affectedIds.includes(entry.workspaceId) && entry.repositoryId === event.repositoryId),
+      );
+      next.workspaces = next.workspaces.map((workspace) => {
+        if (!affectedIds.includes(workspace.id)) return workspace;
+        const repositories = workspace.repositories.filter(
+          (entry) => entry.repositoryId !== event.repositoryId,
+        );
+        const projectId = next.items.find((item) => item.id === workspace.item_id)?.project_id;
+        const required = next.repositories.filter(
+          (repository) => repository.project_id === projectId,
+        );
+        const complete =
+          required.length > 0 &&
+          required.every((repository) =>
+            next.worktrees.some(
+              (tree) => tree.workspaceId === workspace.id && tree.repositoryId === repository.id,
+            ),
+          );
+        const preparation_state: typeof workspace.preparation_state = complete
+          ? "ready"
+          : workspace.preparation_state === "resumable"
+            ? "resumable"
+            : "pending";
+        return { ...workspace, repositories, preparation_state };
+      });
+      effects.push(
+        ...removedWorktreeIds.map((worktreeId) => ({
+          type: "remove_worktree" as const,
+          worktreeId,
+        })),
+      );
+      for (const workspace of next.workspaces.filter((entry) => affectedIds.includes(entry.id)))
+        effects.push({ type: "persist_workspace_update", workspace: structuredClone(workspace) });
+      effects.push({ type: "remove_repository", repositoryId: event.repositoryId });
+      break;
+    }
+    case "delete_item": {
+      const plan = planItemDeletion(next, event.itemId);
+      if (plan.activeRunIds.length)
+        throw new DomainError(
+          `Item deletion is blocked:\n${plan.activeRunIds.map((id) => `Run #${id} is active; stop it before deleting this Item.`).join("\n")}`,
+        );
+      const orphaned = plan.orphanedExternalObjectIds;
+      next.items = next.items.filter((entry) => entry.id !== event.itemId);
+      const workspaceIds = plan.workspaces.map((entry) => entry.id);
+      next.workspaces = next.workspaces.filter((entry) => !workspaceIds.includes(entry.id));
+      next.worktrees = next.worktrees.filter((entry) => !workspaceIds.includes(entry.workspaceId));
+      next.runs = next.runs.filter((entry) => entry.item_id !== event.itemId);
+      next.relationships = next.relationships.filter(
+        (entry) => entry.from_item_id !== event.itemId && entry.to_item_id !== event.itemId,
+      );
+      next.links = next.links.filter((entry) => entry.item_id !== event.itemId);
+      next.external_objects = next.external_objects.filter((entry) => !orphaned.includes(entry.id));
+      next.snapshots = next.snapshots.filter(
+        (entry) => !orphaned.includes(entry.external_object_id),
+      );
+      next.activities = next.activities.filter(
+        (entry) => !orphaned.includes(entry.external_object_id),
+      );
+      effects.push({
+        type: "remove_item_cascade",
+        itemId: event.itemId,
+        orphanedExternalObjectIds: orphaned,
+      });
+      break;
+    }
+    case "delete_project": {
+      const plan = planParentDeletion(next, null, event.projectId);
+      if (
+        !parentSelectionMatches(
+          plan.items.map((entry) => entry.id),
+          event.itemIds,
+        ) ||
+        !parentSelectionMatches(
+          plan.repositories.map((entry) => entry.id),
+          event.repositoryIds,
+        ) ||
+        !parentSelectionMatches(
+          plan.workspaces.map((entry) => entry.id),
+          event.workspaceIds,
+        )
+      )
+        throw new DomainError(`Project ${event.projectId} deletion plan does not match`);
+      if (plan.activeRunIds.length)
+        throw new DomainError(
+          `Project deletion is blocked:\n${plan.activeRunIds.map((id) => `Run #${id} is active; stop it before deleting this Project.`).join("\n")}`,
+        );
+      const itemIds = plan.items.map((entry) => entry.id);
+      const workspaceIds = plan.workspaces.map((entry) => entry.id);
+      const repositoryIds = plan.repositories.map((entry) => entry.id);
+      const orphaned = plan.orphanedExternalObjectIds;
+      next.items = next.items.filter((entry) => !itemIds.includes(entry.id));
+      next.workspaces = next.workspaces.filter((entry) => !workspaceIds.includes(entry.id));
+      next.worktrees = next.worktrees.filter((entry) => !workspaceIds.includes(entry.workspaceId));
+      next.runs = next.runs.filter((entry) => !itemIds.includes(entry.item_id));
+      next.relationships = next.relationships.filter(
+        (entry) => !itemIds.includes(entry.from_item_id) && !itemIds.includes(entry.to_item_id),
+      );
+      next.links = next.links.filter((entry) => !itemIds.includes(entry.item_id));
+      next.external_objects = next.external_objects.filter((entry) => !orphaned.includes(entry.id));
+      next.snapshots = next.snapshots.filter(
+        (entry) => !orphaned.includes(entry.external_object_id),
+      );
+      next.activities = next.activities.filter(
+        (entry) => !orphaned.includes(entry.external_object_id),
+      );
+      next.repositories = next.repositories.filter((entry) => !repositoryIds.includes(entry.id));
+      next.repository_locations = next.repository_locations.filter(
+        (entry) => !repositoryIds.includes(entry.repository_id),
+      );
+      next.projects = next.projects.filter((entry) => entry.id !== event.projectId);
+      effects.push({
+        type: "remove_project_cascade",
+        projectId: event.projectId,
+        orphanedExternalObjectIds: orphaned,
+      });
+      break;
+    }
+    case "delete_context": {
+      const plan = planParentDeletion(next, event.contextId, null);
+      if (next.contexts.length === 1) throw new DomainError("Cannot delete the last Context");
+      if (
+        !parentSelectionMatches(
+          plan.projects.map((entry) => entry.id),
+          event.projectIds,
+        ) ||
+        !parentSelectionMatches(
+          plan.items.map((entry) => entry.id),
+          event.itemIds,
+        ) ||
+        !parentSelectionMatches(
+          plan.repositories.map((entry) => entry.id),
+          event.repositoryIds,
+        ) ||
+        !parentSelectionMatches(
+          plan.workspaces.map((entry) => entry.id),
+          event.workspaceIds,
+        ) ||
+        !parentSelectionMatches(
+          plan.machines.map((entry) => entry.id),
+          event.machineIds,
+        )
+      )
+        throw new DomainError(`Context ${event.contextId} deletion plan does not match`);
+      if (plan.activeRunIds.length)
+        throw new DomainError(
+          `Context deletion is blocked:\n${plan.activeRunIds.map((id) => `Run #${id} is active; stop it before deleting this Context.`).join("\n")}`,
+        );
+      const projectIds = plan.projects.map((entry) => entry.id);
+      const itemIds = plan.items.map((entry) => entry.id);
+      const repositoryIds = plan.repositories.map((entry) => entry.id);
+      const workspaceIds = plan.workspaces.map((entry) => entry.id);
+      const machineIds = plan.machines.map((entry) => entry.id);
+      const orphaned = plan.orphanedExternalObjectIds;
+      const contextsUsingDeletedMachines = next.contexts
+        .filter(
+          (entry) =>
+            entry.id !== event.contextId &&
+            typeof entry.execution_machine_id === "number" &&
+            machineIds.includes(entry.execution_machine_id),
+        )
+        .map((entry) => ({
+          ...entry,
+          execution_machine_id: null,
+          claude_profile_id: null,
+          codex_profile_id: null,
+        }));
+      next.contexts = next.contexts.map(
+        (entry) => contextsUsingDeletedMachines.find((updated) => updated.id === entry.id) ?? entry,
+      );
+      next.contexts = next.contexts.filter((entry) => entry.id !== event.contextId);
+      next.projects = next.projects.filter((entry) => !projectIds.includes(entry.id));
+      next.items = next.items.filter((entry) => !itemIds.includes(entry.id));
+      next.repositories = next.repositories.filter((entry) => !repositoryIds.includes(entry.id));
+      next.repository_locations = next.repository_locations.filter(
+        (entry) => !repositoryIds.includes(entry.repository_id),
+      );
+      next.workspaces = next.workspaces.filter((entry) => !workspaceIds.includes(entry.id));
+      next.worktrees = next.worktrees.filter((entry) => !workspaceIds.includes(entry.workspaceId));
+      next.runs = next.runs.filter((entry) => !plan.runs.some((run) => run.id === entry.id));
+      next.machines = next.machines.filter((entry) => !machineIds.includes(entry.id));
+      next.cli_configuration_profiles = next.cli_configuration_profiles.filter(
+        (entry) => !machineIds.includes(entry.machineId),
+      );
+      next.relationships = next.relationships.filter(
+        (entry) => !itemIds.includes(entry.from_item_id) && !itemIds.includes(entry.to_item_id),
+      );
+      next.links = next.links.filter((entry) => !itemIds.includes(entry.item_id));
+      next.external_objects = next.external_objects.filter((entry) => !orphaned.includes(entry.id));
+      next.snapshots = next.snapshots.filter(
+        (entry) => !orphaned.includes(entry.external_object_id),
+      );
+      next.activities = next.activities.filter(
+        (entry) => !orphaned.includes(entry.external_object_id),
+      );
+      next.attention_defaults = next.attention_defaults.filter(
+        (entry) => entry.context_id !== event.contextId,
+      );
+      effects.push(
+        ...contextsUsingDeletedMachines.map((context) => ({
+          type: "update_context" as const,
+          context: structuredClone(context),
+        })),
+        {
+          type: "remove_context_cascade",
+          contextId: event.contextId,
+          orphanedExternalObjectIds: orphaned,
+        },
+      );
+      break;
+    }
+    case "delete_external_object": {
+      planExternalObjectDeletion(next, event.externalObjectId);
+      next.links = next.links.filter(
+        (entry) => entry.external_object_id !== event.externalObjectId,
+      );
+      next.external_objects = next.external_objects.filter(
+        (entry) => entry.id !== event.externalObjectId,
+      );
+      next.snapshots = next.snapshots.filter(
+        (entry) => entry.external_object_id !== event.externalObjectId,
+      );
+      next.activities = next.activities.filter(
+        (entry) => entry.external_object_id !== event.externalObjectId,
+      );
+      effects.push({ type: "remove_external_object", externalObjectId: event.externalObjectId });
+      break;
+    }
+    case "delete_link": {
+      const link = next.links.find((entry) => entry.id === event.linkId);
+      if (!link) throw new DomainError(`Link ${event.linkId} does not exist`);
+      const externalObjectId = link.external_object_id;
+      const detached =
+        link.purpose === "to-spec"
+          ? next.links
+              .filter(
+                (entry) =>
+                  entry.item_id === link.item_id &&
+                  entry.spec_external_object_id === externalObjectId &&
+                  entry.id !== link.id,
+              )
+              .map((entry) => {
+                entry.spec_external_object_id = null;
+                return structuredClone(entry);
+              })
+          : [];
+      next.links = next.links.filter((entry) => entry.id !== event.linkId);
+      const orphaned = !next.links.some((entry) => entry.external_object_id === externalObjectId);
+      if (orphaned) {
+        next.external_objects = next.external_objects.filter(
+          (entry) => entry.id !== externalObjectId,
+        );
+        next.snapshots = next.snapshots.filter(
+          (entry) => entry.external_object_id !== externalObjectId,
+        );
+        next.activities = next.activities.filter(
+          (entry) => entry.external_object_id !== externalObjectId,
+        );
+      }
+      effects.push(
+        ...detached.map((entry) => ({ type: "persist_link_state" as const, link: entry })),
+        { type: "remove_link", linkId: event.linkId, externalObjectId },
+      );
+      if (orphaned) effects.push({ type: "remove_external_object", externalObjectId });
+      break;
+    }
+    case "remove_worktree": {
+      const worktree = next.worktrees.find((entry) => entry.id === event.worktreeId);
+      if (!worktree) throw new DomainError(`Worktree ${event.worktreeId} does not exist`);
+      next.worktrees = next.worktrees.filter((entry) => entry.id !== event.worktreeId);
+      const workspace = next.workspaces.find((entry) => entry.id === worktree.workspaceId);
+      if (!workspace) throw new DomainError(`Workspace ${worktree.workspaceId} does not exist`);
+      const itemProjectId = next.items.find((entry) => entry.id === workspace.item_id)?.project_id;
+      const repositories = next.repositories.filter((entry) => entry.project_id === itemProjectId);
+      const complete =
+        repositories.length > 0 &&
+        repositories.every((repository) =>
+          next.worktrees.some(
+            (entry) => entry.workspaceId === workspace.id && entry.repositoryId === repository.id,
+          ),
+        );
+      const preparation_state: typeof workspace.preparation_state = complete
+        ? "ready"
+        : workspace.preparation_state === "resumable"
+          ? "resumable"
+          : "pending";
+      const updated = { ...workspace, preparation_state };
+      next.workspaces = next.workspaces.map((entry) => (entry.id === updated.id ? updated : entry));
+      effects.push(
+        { type: "remove_worktree", worktreeId: event.worktreeId },
+        { type: "persist_workspace_update", workspace: updated },
+      );
+      break;
+    }
+    case "reset_local_data": {
+      const active = next.runs.filter(runIsActive).map(({ id }) => id);
+      if (active.length) throw new DomainError(`Reset has active Runs: [${active.join(", ")}]`);
+      const contextId = next.next_context_id;
+      const nextContextId = contextId + 1;
+      const projectId = next.next_project_id;
+      const nextProjectId = projectId + 1;
+      const context: Context = {
+        id: contextId,
+        name: "Personal",
+        execution_machine_id: null,
+        claude_profile_id: null,
+        codex_profile_id: null,
+        check_dirty_checkouts: true,
+        grill_defaults: { agent: "claude", model: "claude-sonnet-5", effort: "high" },
+        implement_defaults: { agent: "claude", model: "claude-sonnet-5", effort: "high" },
+        default_workflow: "matt-pocock",
+        pstack_defaults: { agent: "claude", model: "claude-sonnet-5", effort: "high" },
+        pstack_roles: structuredClone(defaultPstackRoles),
+        gh_executable_path: null,
+        twg_executable_path: null,
+        az_executable_path: null,
+        atlassian_site: null,
+        azure_devops_organization: null,
+        bitbucket_workspace: null,
+      };
+      const project: Project = {
+        id: projectId,
+        context_id: contextId,
+        name: "Default",
+        defaults: { item_status: "Inbox", execution_mode: "worktree" },
+      };
+      Object.assign(next, {
+        next_context_id: nextContextId,
+        next_project_id: nextProjectId,
+        contexts: [context],
+        projects: [project],
+        repositories: [],
+        repository_locations: [],
+        items: [],
+        workspaces: [],
+        worktrees: [],
+        machines: [],
+        cli_configuration_profiles: [],
+        runs: [],
+        implementation_queues: [],
+        relationships: [],
+        external_objects: [],
+        links: [],
+        snapshots: [],
+        activities: [],
+        attention_defaults: [],
+      });
+      effects.push({ type: "reset_local_data", context, project, nextContextId, nextProjectId });
       break;
     }
   }

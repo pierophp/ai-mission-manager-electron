@@ -260,12 +260,13 @@ export class GitCli {
     machine: Machine,
     checkoutPath: string,
     worktreePath: string,
+    destructiveConfirmed = false,
   ): Promise<void> {
     await this.git(
       machine,
       "remove the Git Worktree",
       checkoutPath,
-      `worktree remove ${machinePathArg(worktreePath)}`,
+      `worktree remove ${destructiveConfirmed ? "--force " : ""}${machinePathArg(worktreePath)}`,
     );
   }
 

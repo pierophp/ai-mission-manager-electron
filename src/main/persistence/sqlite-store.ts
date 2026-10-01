@@ -441,6 +441,153 @@ export class SqliteStore {
           effect.nextActivityId,
         );
         break;
+      case "remove_repository": {
+        const id = effect.repositoryId;
+        db.prepare("DELETE FROM repository_locations WHERE repository_id=?").run(id);
+        db.prepare("DELETE FROM workspace_repositories WHERE repository_id=?").run(id);
+        db.prepare("DELETE FROM repositories WHERE id=?").run(id);
+        break;
+      }
+      case "remove_worktree":
+        db.prepare("DELETE FROM worktrees WHERE id=?").run(effect.worktreeId);
+        break;
+      case "remove_link":
+        db.prepare("DELETE FROM external_links WHERE id=?").run(effect.linkId);
+        break;
+      case "remove_external_object":
+        db.prepare("DELETE FROM external_objects WHERE id=?").run(effect.externalObjectId);
+        break;
+      case "remove_item_cascade": {
+        const id = effect.itemId;
+        db.prepare("DELETE FROM runs WHERE item_id=?").run(id);
+        db.prepare(
+          "DELETE FROM worktrees WHERE workspace_id IN (SELECT id FROM workspaces WHERE item_id=?)",
+        ).run(id);
+        db.prepare(
+          "DELETE FROM workspace_repositories WHERE workspace_id IN (SELECT id FROM workspaces WHERE item_id=?)",
+        ).run(id);
+        db.prepare("DELETE FROM workspaces WHERE item_id=?").run(id);
+        db.prepare("DELETE FROM reminders WHERE item_id=?").run(id);
+        db.prepare("DELETE FROM item_relationships WHERE from_item_id=? OR to_item_id=?").run(
+          id,
+          id,
+        );
+        db.prepare("DELETE FROM external_links WHERE item_id=?").run(id);
+        for (const objectId of effect.orphanedExternalObjectIds)
+          db.prepare(
+            "DELETE FROM external_objects WHERE id=? AND NOT EXISTS (SELECT 1 FROM external_links WHERE external_object_id=external_objects.id)",
+          ).run(objectId);
+        db.prepare("DELETE FROM items WHERE id=?").run(id);
+        break;
+      }
+      case "remove_project_cascade": {
+        const id = effect.projectId;
+        db.prepare(
+          "DELETE FROM runs WHERE item_id IN (SELECT id FROM items WHERE project_id=?)",
+        ).run(id);
+        db.prepare(
+          "DELETE FROM worktrees WHERE workspace_id IN (SELECT workspaces.id FROM workspaces JOIN items ON items.id=workspaces.item_id WHERE items.project_id=?)",
+        ).run(id);
+        db.prepare(
+          "DELETE FROM workspace_repositories WHERE workspace_id IN (SELECT workspaces.id FROM workspaces JOIN items ON items.id=workspaces.item_id WHERE items.project_id=?)",
+        ).run(id);
+        db.prepare(
+          "DELETE FROM workspaces WHERE item_id IN (SELECT id FROM items WHERE project_id=?)",
+        ).run(id);
+        db.prepare(
+          "DELETE FROM reminders WHERE item_id IN (SELECT id FROM items WHERE project_id=?)",
+        ).run(id);
+        db.prepare(
+          "DELETE FROM item_relationships WHERE from_item_id IN (SELECT id FROM items WHERE project_id=?) OR to_item_id IN (SELECT id FROM items WHERE project_id=?)",
+        ).run(id, id);
+        db.prepare(
+          "DELETE FROM external_links WHERE item_id IN (SELECT id FROM items WHERE project_id=?)",
+        ).run(id);
+        for (const objectId of effect.orphanedExternalObjectIds)
+          db.prepare(
+            "DELETE FROM external_objects WHERE id=? AND NOT EXISTS (SELECT 1 FROM external_links WHERE external_object_id=external_objects.id)",
+          ).run(objectId);
+        db.prepare("DELETE FROM items WHERE project_id=?").run(id);
+        db.prepare("DELETE FROM repositories WHERE project_id=?").run(id);
+        db.prepare("DELETE FROM projects WHERE id=?").run(id);
+        break;
+      }
+      case "remove_context_cascade": {
+        const id = effect.contextId;
+        const itemQuery =
+          "SELECT items.id FROM items JOIN projects ON projects.id=items.project_id WHERE projects.context_id=?";
+        db.prepare(
+          `DELETE FROM runs WHERE machine_id IN (SELECT id FROM machines WHERE context_id=?) OR item_id IN (${itemQuery})`,
+        ).run(id, id);
+        db.prepare(
+          `DELETE FROM worktrees WHERE workspace_id IN (SELECT workspaces.id FROM workspaces JOIN items ON items.id=workspaces.item_id JOIN projects ON projects.id=items.project_id WHERE projects.context_id=?)`,
+        ).run(id);
+        db.prepare(
+          `DELETE FROM workspace_repositories WHERE workspace_id IN (SELECT workspaces.id FROM workspaces JOIN items ON items.id=workspaces.item_id JOIN projects ON projects.id=items.project_id WHERE projects.context_id=?)`,
+        ).run(id);
+        db.prepare(`DELETE FROM workspaces WHERE item_id IN (${itemQuery})`).run(id);
+        db.prepare(`DELETE FROM reminders WHERE item_id IN (${itemQuery})`).run(id);
+        db.prepare(
+          `DELETE FROM item_relationships WHERE from_item_id IN (${itemQuery}) OR to_item_id IN (${itemQuery})`,
+        ).run(id, id);
+        db.prepare(`DELETE FROM external_links WHERE item_id IN (${itemQuery})`).run(id);
+        for (const objectId of effect.orphanedExternalObjectIds)
+          db.prepare(
+            "DELETE FROM external_objects WHERE id=? AND NOT EXISTS (SELECT 1 FROM external_links WHERE external_object_id=external_objects.id)",
+          ).run(objectId);
+        db.prepare(
+          `DELETE FROM items WHERE project_id IN (SELECT id FROM projects WHERE context_id=?)`,
+        ).run(id);
+        db.prepare(
+          `DELETE FROM repositories WHERE project_id IN (SELECT id FROM projects WHERE context_id=?)`,
+        ).run(id);
+        db.prepare("DELETE FROM machines WHERE context_id=?").run(id);
+        db.prepare("DELETE FROM context_attention_defaults WHERE context_id=?").run(id);
+        db.prepare("DELETE FROM projects WHERE context_id=?").run(id);
+        db.prepare("DELETE FROM contexts WHERE id=?").run(id);
+        break;
+      }
+      case "reset_local_data": {
+        db.exec(
+          "DELETE FROM audit_entries; DELETE FROM link_attention_state; DELETE FROM activities; DELETE FROM external_snapshots; DELETE FROM external_links; DELETE FROM external_objects; DELETE FROM context_attention_defaults; DELETE FROM item_relationships; DELETE FROM reminders; DELETE FROM runs; DELETE FROM worktrees; DELETE FROM workspace_repositories; DELETE FROM workspaces; DELETE FROM repository_locations; DELETE FROM items; DELETE FROM repositories; DELETE FROM machines; DELETE FROM cli_configuration_profiles; DELETE FROM projects; DELETE FROM contexts;",
+        );
+        const c = effect.context;
+        db.prepare(
+          "INSERT INTO contexts (id,name,execution_machine_id,check_dirty_checkouts,grill_agent,grill_model,grill_effort,implement_agent,implement_model,implement_effort,default_workflow,pstack_agent,pstack_model,pstack_effort,pstack_roles_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ).run(
+          c.id,
+          c.name,
+          null,
+          1,
+          c.grill_defaults.agent,
+          c.grill_defaults.model,
+          c.grill_defaults.effort,
+          c.implement_defaults?.agent ?? "claude",
+          c.implement_defaults?.model ?? "claude-sonnet-5",
+          c.implement_defaults?.effort ?? "high",
+          c.default_workflow ?? "matt-pocock",
+          c.pstack_defaults?.agent ?? "claude",
+          c.pstack_defaults?.model ?? "claude-sonnet-5",
+          c.pstack_defaults?.effort ?? "high",
+          encodePstackRoleTable(c),
+        );
+        db.prepare(
+          "INSERT INTO projects(id,context_id,name,default_item_status,default_execution_mode) VALUES(?,?,?,?,?)",
+        ).run(
+          effect.project.id,
+          effect.project.context_id,
+          effect.project.name,
+          effect.project.defaults.item_status,
+          effect.project.defaults.execution_mode,
+        );
+        db.prepare("UPDATE metadata SET value=? WHERE key='next_context_id'").run(
+          effect.nextContextId,
+        );
+        db.prepare("UPDATE metadata SET value=? WHERE key='next_project_id'").run(
+          effect.nextProjectId,
+        );
+        break;
+      }
       case "update_context":
         persist(effect.context);
         break;
@@ -571,6 +718,11 @@ export class SqliteStore {
   }
   listAuditHistory(): AuditEntry[] {
     return listAuditHistory(this.database);
+  }
+  auditEntryCount(): number {
+    return Number(
+      this.database.prepare("SELECT COUNT(*) AS count FROM audit_entries").get()?.count ?? 0,
+    );
   }
   getActivityTab(): ActivityTabView {
     return getActivityTab(this.database);

@@ -11,6 +11,7 @@ import { openSqliteStore } from "./persistence/sqlite-store";
 import { Runtime } from "./runtime";
 import { createStructureCommandHandlers } from "./structure-commands";
 import { createWorkCommandHandlers } from "./work-commands";
+import { createDeletionCommandHandlers } from "./deletion-commands";
 import { createCommandDispatcher, invokeEnvelope } from "../shared/ipc";
 
 const directories: string[] = [];
@@ -362,6 +363,7 @@ describe("Git adapter", () => {
     const dispatch = createCommandDispatcher({
       ...createStructureCommandHandlers(runtime, access, store),
       ...createWorkCommandHandlers(runtime, access),
+      ...createDeletionCommandHandlers(runtime, access),
     });
     await invokeEnvelope(dispatch, "register_repository_at_location", {
       projectId: 1,
@@ -407,6 +409,30 @@ describe("Git adapter", () => {
       is_dirty: 0,
     });
     raw.close();
+    await writeFile(
+      path.join(home, "worktrees/workspace-1/mission-I-1/service/dirty.txt"),
+      "keep until confirmed\n",
+    );
+    const removal = (await invokeEnvelope(dispatch, "prepare_worktree_removal", {
+      worktreeId: 1,
+    })) as { isDirty: boolean; requiresDestructiveConfirmation: boolean };
+    expect(removal).toMatchObject({ isDirty: true, requiresDestructiveConfirmation: true });
+    await expect(
+      invokeEnvelope(dispatch, "remove_worktree", {
+        worktreeId: 1,
+        confirmed: true,
+        destructiveConfirmed: false,
+      }),
+    ).rejects.toBe("Removing a dirty Worktree requires destructive confirmation");
+    await invokeEnvelope(dispatch, "remove_worktree", {
+      worktreeId: 1,
+      confirmed: true,
+      destructiveConfirmed: true,
+    });
+    expect(store.loadState().worktrees).toHaveLength(0);
+    expect(
+      git(path.join(home, "checkouts/service"), "show-ref", "--verify", "refs/heads/mission-I-1"),
+    ).toContain("refs/heads/mission-I-1");
     runtime.dispatch({
       type: "create_item",
       title: "Attach existing Worktree",
@@ -458,7 +484,7 @@ describe("Git adapter", () => {
       path: "~/manually-created/service",
       branch: "mission-I-3",
     });
-    expect(store.loadState().worktrees).toHaveLength(3);
+    expect(store.loadState().worktrees).toHaveLength(2);
     store.close();
   });
 });

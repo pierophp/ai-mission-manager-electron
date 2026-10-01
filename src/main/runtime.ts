@@ -17,6 +17,9 @@ export class Runtime {
   snapshot(): DomainState {
     return structuredClone(this.state);
   }
+  auditEntryCount(): number {
+    return this.store.auditEntryCount();
+  }
   dispatch(event: Event): DomainState {
     return this.dispatchMany([event]);
   }

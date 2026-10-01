@@ -154,7 +154,29 @@ export type Event =
   | { type: "set_link_review_at"; linkId: number; reviewAt: string | null }
   | { type: "clear_link_review_at"; linkId: number }
   | { type: "set_link_attention_policy"; linkId: number; policy: ExternalChangePolicy | null }
-  | { type: "mark_link_reviewed"; linkId: number };
+  | { type: "mark_link_reviewed"; linkId: number }
+  | {
+      type: "delete_project";
+      projectId: number;
+      itemIds: number[];
+      repositoryIds: number[];
+      workspaceIds: number[];
+    }
+  | {
+      type: "delete_context";
+      contextId: number;
+      projectIds: number[];
+      itemIds: number[];
+      repositoryIds: number[];
+      workspaceIds: number[];
+      machineIds: number[];
+    }
+  | { type: "delete_repository"; repositoryId: number; workspaceIds: number[] }
+  | { type: "delete_item"; itemId: number }
+  | { type: "delete_external_object"; externalObjectId: number }
+  | { type: "delete_link"; linkId: number }
+  | { type: "remove_worktree"; worktreeId: number }
+  | { type: "reset_local_data" };
 
 export type Effect =
   | { type: "persist_context"; context: Context; nextContextId: number }
@@ -205,6 +227,20 @@ export type Effect =
   | { type: "persist_external_link"; link: DomainState["links"][number]; nextLinkId: number }
   | { type: "persist_link_state"; link: DomainState["links"][number] }
   | { type: "persist_external_snapshot"; snapshot: ExternalSnapshot }
-  | { type: "persist_activity"; activity: import("./types").Activity; nextActivityId: number };
+  | { type: "persist_activity"; activity: import("./types").Activity; nextActivityId: number }
+  | { type: "remove_repository"; repositoryId: number }
+  | { type: "remove_item_cascade"; itemId: number; orphanedExternalObjectIds: number[] }
+  | { type: "remove_project_cascade"; projectId: number; orphanedExternalObjectIds: number[] }
+  | { type: "remove_context_cascade"; contextId: number; orphanedExternalObjectIds: number[] }
+  | { type: "remove_external_object"; externalObjectId: number }
+  | { type: "remove_link"; linkId: number; externalObjectId: number }
+  | { type: "remove_worktree"; worktreeId: number }
+  | {
+      type: "reset_local_data";
+      context: Context;
+      project: Project;
+      nextContextId: number;
+      nextProjectId: number;
+    };
 
 export type Decision = { state: import("./model").DomainState; effects: Effect[] };
