@@ -16,6 +16,7 @@ import { ensureStateRunsDirectory, provisionAgentState, stateFilePath } from "./
 import { provisionPstackTree, pstackTreeDirectory, pstackSkillSnapshot } from "./pstack";
 import { productSkills } from "./generated-resources";
 import type { DirectRunPreview, Machine, RunCheckout, Workflow } from "../domain/types";
+import { composeImplementationQueuePrompt } from "../domain/implementation-queue";
 
 const execFileAsync = promisify(execFile);
 
@@ -417,6 +418,8 @@ export function createRunLaunchHandlers(
       const project = state.projects.find((candidate) => candidate.id === item.project_id)!;
       const context = state.contexts.find((candidate) => candidate.id === project.context_id)!;
       const strategy = request.strategy as RunLaunchStrategy;
+      if (strategy.kind === "direct" && strategy.implementationQueue && !strategy.configuration)
+        throw new Error("Implementation Queue configuration is required");
       let machine: Machine;
       let worktreeId: number | null = null;
       let repositoryId: number;
@@ -565,7 +568,12 @@ export function createRunLaunchHandlers(
       if (strategy.kind === "direct" && strategy.implementationQueue) {
         const ticket = strategy.implementationQueue.entries[0];
         if (!ticket) throw new Error("Implementation Queue has no tickets");
-        launchPrompt = `Implement ${ticket.ticketTitle} (#${ticket.ticketNumber}) from ${ticket.ticketUrl}\n\nSpec: ${strategy.implementationQueue.specUrl}`;
+        launchPrompt = composeImplementationQueuePrompt(
+          productSkills.implement,
+          ticket.ticketNumber,
+          ticket.ticketUrl,
+          strategy.implementationQueue.specUrl,
+        );
       }
       let skillSnapshot: string | null = null;
       if (workflow === "pstack") {
@@ -653,7 +661,21 @@ export function createRunLaunchHandlers(
         plan_path: null,
       };
       try {
-        runtime.dispatch({ type: "start_run", run, queueAttachment: request.queueAttachment });
+        runtime.dispatch({
+          type: "start_run",
+          run,
+          queueAttachment: request.queueAttachment,
+          ...(strategy.kind === "direct" && strategy.implementationQueue && configuration
+            ? {
+                queueStart: {
+                  start: strategy.implementationQueue,
+                  configuration,
+                  allowDirty: strategy.allowDirty,
+                  allowSharedCheckouts: strategy.allowSharedCheckouts,
+                },
+              }
+            : {}),
+        });
       } catch (error) {
         await terminal.killSession(machine, session).catch(() => undefined);
         throw error;

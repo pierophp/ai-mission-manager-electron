@@ -390,6 +390,44 @@ export function homeView(
       summary: `Run #${run.id} is blocked and needs your input`,
     });
   }
+  for (const queue of state.implementation_queues.filter(
+    (candidate) => candidate.active && candidate.pausedReason !== null,
+  )) {
+    const entry = queue.entries.find((candidate) => !candidate.done && !candidate.skipped);
+    const link = state.links.find(
+      (candidate) =>
+        candidate.item_id === queue.itemId &&
+        candidate.external_object_id === queue.specExternalObjectId,
+    );
+    const object = state.external_objects.find(
+      (candidate) => candidate.id === queue.specExternalObjectId,
+    );
+    if (!entry || !link || !object || !views.some(({ item }) => item.id === queue.itemId)) continue;
+    const reason = queue.pausedReason!;
+    const reasonText =
+      reason.kind === "ticket_still_open"
+        ? "ticket is still open"
+        : reason.kind === "checkout_dirty"
+          ? "checkout is dirty"
+          : reason.kind === "run_stopped"
+            ? "Run was stopped"
+            : reason.kind === "pane_missing"
+              ? "Run Pane is missing"
+              : `next Run failed to launch: ${reason.message}`;
+    entries.push({
+      kind: "implementation_queue",
+      link_id: link.id,
+      reminder_id: null,
+      run_id: entry.runId,
+      queue_id: queue.id,
+      item_id: queue.itemId,
+      external_object_id: object.id,
+      source_title: entry.ticketTitle,
+      source_url: entry.ticketUrl,
+      activities: [],
+      summary: `Implementation Queue ticket #${entry.ticketNumber} paused: ${reasonText}`,
+    });
+  }
   const home: HomeView = {
     needs_attention: [],
     attention_entries: entries,

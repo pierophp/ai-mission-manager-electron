@@ -367,6 +367,10 @@ export class SqliteStore {
           "INSERT INTO implementation_queues(id,item_id,queue_json) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET queue_json=excluded.queue_json",
         ).run(effect.queue.id, effect.queue.itemId, encodeImplementationQueue(effect.queue));
         break;
+      case "close_implementation_run_session":
+      case "launch_implementation_queue_entry":
+        // Application effects are executed by the work command adapter after the transaction commits.
+        break;
       case "persist_cli_configuration_profile":
         db.prepare(
           "INSERT INTO cli_configuration_profiles(id,machine_id,provider,name,directory,app_managed) VALUES(?,?,?,?,?,?)",

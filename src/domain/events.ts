@@ -29,9 +29,30 @@ export type Event =
       type: "start_run";
       run: import("./execution-types").Run;
       queueAttachment?: { queueId: number; position: number };
+      queueStart?: {
+        start: import("./types").ImplementationQueueStart;
+        configuration: GrillConfiguration;
+        allowDirty: boolean;
+        allowSharedCheckouts: boolean;
+      };
     }
   | { type: "stop_run"; runId: number }
   | { type: "finish_run"; runId: number }
+  | {
+      type: "advance_implementation_queue";
+      queueId: number;
+      runId: number;
+      ticketClosed: boolean;
+      checkoutClean: boolean;
+    }
+  | {
+      type: "pause_implementation_queue";
+      queueId: number;
+      reason: import("./types").ImplementationQueuePauseReason;
+    }
+  | { type: "skip_implementation_queue_entry"; queueId: number; position: number }
+  | { type: "cancel_implementation_queue"; queueId: number }
+  | { type: "set_implementation_queue_entry_run"; queueId: number; position: number; runId: number }
   | { type: "delete_run"; runId: number }
   | {
       type: "delete_machine";
@@ -275,6 +296,8 @@ export type Effect =
   | { type: "remove_run"; runId: number }
   | { type: "remove_machine"; machineId: number }
   | { type: "persist_implementation_queue"; queue: import("./types").ImplementationQueue }
+  | { type: "close_implementation_run_session"; runId: number }
+  | { type: "launch_implementation_queue_entry"; queueId: number; position: number }
   | {
       type: "persist_cli_configuration_profile";
       profile: CliConfigurationProfile;

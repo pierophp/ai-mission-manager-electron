@@ -140,7 +140,7 @@ function mismatchWarning(state: DomainState, contextId: number, url: string): st
     ? `This External Object targets a different site or organization than the identifiers configured for Context '${context.name}'. The Link was created.`
     : null;
 }
-async function registeredLocalMarkdown(state: DomainState, itemId: number, url: string) {
+export async function registeredLocalMarkdown(state: DomainState, itemId: number, url: string) {
   const item = state.items.find((entry) => entry.id === itemId);
   if (!item) throw new Error(`Item ${itemId} does not exist`);
   const project = state.projects.find((entry) => entry.id === item.project_id);
@@ -150,6 +150,24 @@ async function registeredLocalMarkdown(state: DomainState, itemId: number, url: 
     context?.execution_machine_id == null
       ? undefined
       : state.machines.find((entry) => entry.id === context.execution_machine_id);
+  const localIdentity = url.match(/^local:(\d+)#(.+)$/);
+  if (localIdentity) {
+    if (!context) throw new Error(`Context ${project.context_id} does not exist`);
+    const resolved = await localMarkdownPathForKey(state, context, project, url);
+    const object = await classifyLocalMarkdown(
+      resolved.repository.id,
+      resolved.root,
+      localIdentity[2]!,
+    );
+    if (!object) throw new Error("This local Markdown link has an invalid repository path");
+    return {
+      object,
+      filename: resolved.filename,
+      context,
+      repository: resolved.repository,
+      location: resolved.location,
+    };
+  }
   if (machine?.transport.kind !== "local") return null;
   for (const repository of state.repositories.filter((entry) => entry.project_id === project.id)) {
     const location = state.repository_locations.find(
@@ -157,6 +175,7 @@ async function registeredLocalMarkdown(state: DomainState, itemId: number, url: 
     );
     if (!location) continue;
     const checkout = resolveMachinePath(location.checkout_path, process.env.HOME ?? "");
+    // classifyLocalMarkdown resolves real paths and checks containment, including symlinks.
     const object = await classifyLocalMarkdown(repository.id, checkout, url);
     if (object)
       return {
@@ -176,7 +195,20 @@ async function localMarkdownPath(
   const object = state.external_objects.find((entry) => entry.id === objectId);
   if (!object) throw new Error(`External Object ${objectId} does not exist`);
   const { context, project } = contextForObject(state, objectId);
-  const identity = object.external_key.match(/^local:(\d+)#(.+)$/);
+  return localMarkdownPathForKey(state, context, project, object.external_key);
+}
+async function localMarkdownPathForKey(
+  state: DomainState,
+  context: DomainState["contexts"][number],
+  project: DomainState["projects"][number],
+  externalKey: string,
+): Promise<{
+  filename: string;
+  root: string;
+  repository: DomainState["repositories"][number];
+  location: DomainState["repository_locations"][number];
+}> {
+  const identity = externalKey.match(/^local:(\d+)#(.+)$/);
   if (!identity) throw new Error("This local Markdown link has an invalid repository path");
   const machine = state.machines.find((entry) => entry.id === context.execution_machine_id);
   if (machine?.transport.kind !== "local")
@@ -233,7 +265,7 @@ async function localMarkdownPath(
     !(await stat(filename)).isFile()
   )
     throw new Error("The local Markdown file is outside its registered Repository checkout");
-  return { filename, root };
+  return { filename, root, repository, location };
 }
 async function localDocument(
   filename: string,

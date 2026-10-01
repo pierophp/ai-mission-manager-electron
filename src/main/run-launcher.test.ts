@@ -164,6 +164,34 @@ describe("Run launch IPC gate", () => {
     expect(store.loadState().implementation_queues[0]?.entries[0]?.runId).toBe(3);
     expect(access.releases.map((entry) => entry.count)).toEqual([1, 2, 3]);
 
+    await expect(
+      handlers.start_run({
+        request: {
+          ...request,
+          strategy: {
+            kind: "direct",
+            machineId: null,
+            primaryRepositoryId: 1,
+            agent: "claude",
+            configuration: undefined,
+            implementationQueue: {
+              specExternalObjectId: 1,
+              specUrl: "https://github.com/acme/app/issues/1",
+              entries: [],
+            },
+            executionProfile: "implement",
+            workflow: "matt-pocock",
+            prompt: "Start queue",
+            promptSelection: { includeObjective: true, externalObjectIds: [] },
+            expectedCheckouts: directPreview.checkouts,
+            allowDirty: false,
+            allowSharedCheckouts: true,
+          },
+        },
+      }),
+    ).rejects.toThrow("Implementation Queue configuration is required");
+    expect(access.releases.map((entry) => entry.count)).toEqual([1, 2, 3]);
+
     const originalItemStatus = runtime.snapshot().items.find((item) => item.id === 1)?.status;
     access.mutateMachineOnStop = true;
     await expect(handlers.stop_run({ runId: 1 })).rejects.toThrow(

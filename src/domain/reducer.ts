@@ -3,6 +3,7 @@ import { formatGrillResponse, grillContinuationAvailable } from "./grilling";
 import { defaultPstackRoles, type DomainState } from "./model";
 import { cleanMachineTransport } from "./machine-transport";
 import { pathIsWithin } from "./paths";
+import { implementationTicketIsOpen } from "./implementation-queue";
 import type {
   Context,
   ContextAttentionDefault,
@@ -353,6 +354,92 @@ export function decide(state: DomainState, event: Event): Decision {
       )
         throw new DomainError("Run CLI configuration profile does not match its Machine and agent");
       let attachedQueue: DomainState["implementation_queues"][number] | undefined;
+      let createdQueue: DomainState["implementation_queues"][number] | undefined;
+      if (event.queueStart) {
+        validateGrill(event.queueStart.configuration);
+        if (run.execution_profile !== "implement")
+          throw new DomainError(`Item ${run.item_id} already has an active Implementation Queue`);
+        if (
+          next.implementation_queues.some((queue) => queue.itemId === run.item_id && queue.active)
+        )
+          throw new DomainError(`Item ${run.item_id} already has an active Implementation Queue`);
+        const start = event.queueStart.start;
+        const spec = next.external_objects.find(
+          (object) =>
+            object.id === start.specExternalObjectId &&
+            ((object.provider === "github" && object.kind === "issue") ||
+              (object.provider === "atlassian" && ["issue", "document"].includes(object.kind)) ||
+              (object.provider === "generic" && object.external_key.startsWith("local:"))),
+        );
+        if (!spec)
+          throw new DomainError(
+            "Implementation spec does not exist or is not supported by an Implementation Queue",
+          );
+        if (
+          !next.links.some(
+            (link) =>
+              link.item_id === run.item_id &&
+              link.external_object_id === spec.id &&
+              link.purpose === "to-spec",
+          )
+        )
+          throw new DomainError("Implementation spec is not linked to the Item");
+        if (start.specUrl !== spec.canonical_url)
+          throw new DomainError("Implementation spec URL does not match the linked spec");
+        const entries = [...start.entries].sort((a, b) => a.position - b.position);
+        const validTicketUrl = (url: string) =>
+          url.startsWith("local:") ||
+          url.startsWith("file://") ||
+          (url.startsWith("https://github.com/") && url.includes("/issues/")) ||
+          (url.startsWith("https://") && url.includes(".atlassian.net/browse/"));
+        if (
+          !entries.length ||
+          entries.some(
+            (entry, index) =>
+              entry.position !== index ||
+              !implementationTicketIsOpen(entry.ticketState) ||
+              entry.ticketNumber <= 0 ||
+              !entry.ticketTitle.trim() ||
+              !validTicketUrl(entry.ticketUrl),
+          ) ||
+          entries.some((entry, index) =>
+            entries
+              .slice(0, index)
+              .some(
+                (previous) =>
+                  previous.ticketNumber === entry.ticketNumber ||
+                  previous.ticketUrl === entry.ticketUrl,
+              ),
+          )
+        )
+          throw new DomainError("Implementation Queue entries must be ordered, unique, and open");
+        if (run.workspace_id === null || run.repository_id === null)
+          throw new DomainError("Implementation Queue requires a Workspace and Repository");
+        const queue: DomainState["implementation_queues"][number] = {
+          id: run.id,
+          itemId: run.item_id,
+          specExternalObjectId: spec.id,
+          specUrl: start.specUrl,
+          workspaceId: run.workspace_id,
+          repositoryId: run.repository_id,
+          configuration: structuredClone(event.queueStart.configuration),
+          allowDirty: event.queueStart.allowDirty,
+          allowSharedCheckouts: event.queueStart.allowSharedCheckouts,
+          entries: entries.map((entry, index) => ({
+            ...entry,
+            position: index,
+            runId: index === 0 ? run.id : null,
+            done: false,
+            skipped: false,
+          })),
+          active: true,
+          pausedReason: null,
+        };
+        createdQueue = queue;
+        next.implementation_queues.push(queue);
+        run.implementation_queue_id = queue.id;
+        run.implementation_queue_position = 0;
+      }
       if (event.queueAttachment) {
         const { queueId, position } = event.queueAttachment;
         attachedQueue = next.implementation_queues.find((queue) => queue.id === queueId);
@@ -386,6 +473,11 @@ export function decide(state: DomainState, event: Event): Decision {
         );
       next.next_run_id++;
       next.runs.push(run);
+      if (createdQueue)
+        effects.push({
+          type: "persist_implementation_queue",
+          queue: structuredClone(createdQueue),
+        });
       effects.push({ type: "persist_run", run, nextRunId: next.next_run_id });
       if (attachedQueue)
         effects.push({
@@ -403,6 +495,15 @@ export function decide(state: DomainState, event: Event): Decision {
         run.grill_phase = "recoverablePaneLoss";
       effects.push({ type: "persist_run_observation", run: structuredClone(run) });
       effects.push({ type: "persist_audit", action: { action: "runStopped", run_id: run.id } });
+      const queue = next.implementation_queues.find(
+        (candidate) =>
+          candidate.active &&
+          candidate.entries.some((entry) => entry.runId === run.id && !entry.done),
+      );
+      if (queue) {
+        queue.pausedReason = { kind: "run_stopped" };
+        effects.push({ type: "persist_implementation_queue", queue: structuredClone(queue) });
+      }
       break;
     }
     case "finish_run": {
@@ -414,6 +515,111 @@ export function decide(state: DomainState, event: Event): Decision {
         run.plan_phase = "awaitingGo";
       effects.push({ type: "persist_run_observation", run: structuredClone(run) });
       effects.push({ type: "persist_audit", action: { action: "runFinished", run_id: run.id } });
+      break;
+    }
+    case "advance_implementation_queue": {
+      const queue = next.implementation_queues.find((candidate) => candidate.id === event.queueId);
+      if (!queue) throw new DomainError(`Implementation Queue ${event.queueId} does not exist`);
+      if (!queue.active) break;
+      const run = next.runs.find(
+        (candidate) => candidate.id === event.runId && candidate.state === "finished",
+      );
+      if (!run)
+        throw new DomainError(
+          `Run ${event.runId} has not finished and cannot advance Implementation Queue ${event.queueId}`,
+        );
+      const index = queue.entries.findIndex((entry) => entry.runId === event.runId);
+      if (index < 0)
+        throw new DomainError(
+          `Run ${event.runId} is not an entry in Implementation Queue ${event.queueId}`,
+        );
+      if (queue.entries[index]!.done) break;
+      const item = next.items.find((candidate) => candidate.id === queue.itemId)!;
+      const project = next.projects.find((candidate) => candidate.id === item.project_id)!;
+      const context = next.contexts.find((candidate) => candidate.id === project.context_id)!;
+      const checkoutClean = event.checkoutClean || !context.check_dirty_checkouts;
+      const wasPaused = queue.pausedReason !== null;
+      if (!event.ticketClosed || !checkoutClean) {
+        queue.pausedReason = { kind: !event.ticketClosed ? "ticket_still_open" : "checkout_dirty" };
+        effects.push({ type: "persist_implementation_queue", queue: structuredClone(queue) });
+        break;
+      }
+      queue.pausedReason = null;
+      queue.entries[index]!.done = true;
+      const nextEntry = queue.entries[index + 1];
+      if (!nextEntry) queue.active = false;
+      effects.push({ type: "persist_implementation_queue", queue: structuredClone(queue) });
+      if (!wasPaused)
+        effects.push({ type: "close_implementation_run_session", runId: event.runId });
+      if (nextEntry)
+        effects.push({
+          type: "launch_implementation_queue_entry",
+          queueId: queue.id,
+          position: nextEntry.position,
+        });
+      break;
+    }
+    case "pause_implementation_queue": {
+      const queue = next.implementation_queues.find((candidate) => candidate.id === event.queueId);
+      if (!queue) throw new DomainError(`Implementation Queue ${event.queueId} does not exist`);
+      if (!queue.active) break;
+      queue.pausedReason = structuredClone(event.reason);
+      effects.push({ type: "persist_implementation_queue", queue: structuredClone(queue) });
+      break;
+    }
+    case "skip_implementation_queue_entry": {
+      const queue = next.implementation_queues.find((candidate) => candidate.id === event.queueId);
+      if (!queue) throw new DomainError(`Implementation Queue ${event.queueId} does not exist`);
+      if (!queue.active || queue.pausedReason === null)
+        throw new DomainError(`Implementation Queue ${event.queueId} is not paused`);
+      const index = queue.entries.findIndex((entry) => entry.position === event.position);
+      if (index < 0)
+        throw new DomainError(
+          `Entry ${event.position} does not exist in Implementation Queue ${event.queueId}`,
+        );
+      const entry = queue.entries[index]!;
+      if (entry.done)
+        throw new DomainError(
+          `Entry ${event.position} in Implementation Queue ${event.queueId} is already done`,
+        );
+      entry.skipped = true;
+      queue.pausedReason = null;
+      const following = queue.entries
+        .slice(index + 1)
+        .find((candidate) => !candidate.done && !candidate.skipped);
+      if (!following) queue.active = false;
+      effects.push({ type: "persist_implementation_queue", queue: structuredClone(queue) });
+      if (following)
+        effects.push({
+          type: "launch_implementation_queue_entry",
+          queueId: queue.id,
+          position: following.position,
+        });
+      break;
+    }
+    case "cancel_implementation_queue": {
+      const queue = next.implementation_queues.find((candidate) => candidate.id === event.queueId);
+      if (!queue) throw new DomainError(`Implementation Queue ${event.queueId} does not exist`);
+      queue.active = false;
+      queue.pausedReason = null;
+      effects.push({ type: "persist_implementation_queue", queue: structuredClone(queue) });
+      break;
+    }
+    case "set_implementation_queue_entry_run": {
+      const queue = next.implementation_queues.find((candidate) => candidate.id === event.queueId);
+      if (!queue) throw new DomainError(`Implementation Queue ${event.queueId} does not exist`);
+      const entry = queue.entries.find((candidate) => candidate.position === event.position);
+      if (!entry)
+        throw new DomainError(
+          `Entry ${event.position} does not exist in Implementation Queue ${event.queueId}`,
+        );
+      if (entry.done)
+        throw new DomainError(
+          `Entry ${event.position} in Implementation Queue ${event.queueId} is already done`,
+        );
+      entry.runId = event.runId;
+      queue.pausedReason = null;
+      effects.push({ type: "persist_implementation_queue", queue: structuredClone(queue) });
       break;
     }
     case "delete_run": {

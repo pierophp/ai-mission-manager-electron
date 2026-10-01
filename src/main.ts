@@ -146,6 +146,7 @@ if (!hasSingleInstance) {
         machineAccess,
         store.setting("tmux_executable_path") ?? "tmux",
       );
+      const runLaunchHandlers = createRunLaunchHandlers(runtime, machineAccess, terminalRuntime);
       ensureProjectWorkspaces(runtime);
       recoverRunStateRecords(runtime, store.path);
       registerIpc(
@@ -169,8 +170,12 @@ if (!hasSingleInstance) {
               for (const window of BrowserWindow.getAllWindows())
                 window.webContents.send("run-questions-changed", runId);
             },
+            (request) =>
+              runLaunchHandlers.start_run({ request }) as Promise<
+                import("./domain/execution-types").Run
+              >,
           ),
-          ...createRunLaunchHandlers(runtime, machineAccess, terminalRuntime),
+          ...runLaunchHandlers,
           ...createMachineDeletionHandlers(runtime, terminalRuntime),
           ...createExternalCommandHandlers(runtime),
           ...createDeletionCommandHandlers(runtime, machineAccess),

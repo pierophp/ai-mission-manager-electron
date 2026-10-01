@@ -33,6 +33,14 @@ import {
 import { productSkills } from "./generated-resources";
 import { decide } from "../domain/state-transition";
 import { createRunWorkflowReconciler } from "./run-workflow-reconciliation";
+import { ProviderDispatch, readMarkdownSnapshot, classifyUrl } from "./provider";
+import { registeredLocalMarkdown } from "./external-commands";
+import type { DomainState } from "../domain/model";
+import type { ImplementationQueue, RunLaunchRequest } from "../domain/types";
+import {
+  composeImplementationQueuePrompt,
+  implementationTicketIsOpen,
+} from "../domain/implementation-queue";
 
 function sameSuggestion(left: RunSuggestion, right: RunSuggestion): boolean {
   return (
@@ -60,6 +68,9 @@ export function createWorkCommandHandlers(
     event: TerminalOutputEvent | TerminalExitEvent,
   ) => void = () => undefined,
   onRunQuestionsChanged: (runId: number) => void = () => undefined,
+  launchQueueRun: (request: RunLaunchRequest) => Promise<Run> = async () => {
+    throw new Error("Implementation Queue Run launcher is unavailable");
+  },
 ) {
   const grillLocks = new Map<number, Promise<void>>();
   const withGrillLock = async <T>(runId: number, operation: () => Promise<T>): Promise<T> => {
@@ -112,6 +123,186 @@ export function createWorkCommandHandlers(
     )
       throw new Error(staleMessage);
     return commit();
+  };
+  const queueLocks = new Map<number, Promise<void>>();
+  const withQueueLock = async <T>(queueId: number, operation: () => Promise<T>): Promise<T> => {
+    const previous = queueLocks.get(queueId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    queueLocks.set(queueId, current);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (queueLocks.get(queueId) === current) queueLocks.delete(queueId);
+    }
+  };
+  const queueEntryPrompt = (entry: ImplementationQueue["entries"][number], specUrl: string) =>
+    composeImplementationQueuePrompt(
+      productSkills.implement,
+      entry.ticketNumber,
+      entry.ticketUrl,
+      specUrl,
+    );
+  const queueProviderConfig = (context: DomainState["contexts"][number]) => ({
+    ghPath: context.gh_executable_path,
+    twgPath: context.twg_executable_path,
+    azPath: context.az_executable_path,
+    atlassianSite: context.atlassian_site,
+    bitbucketWorkspace: context.bitbucket_workspace,
+    azureDevOpsOrganization: context.azure_devops_organization,
+  });
+  const launchQueueEntry = async (queueId: number, position: number, sourceRunId: number) => {
+    const state = runtime.snapshot();
+    const queue = state.implementation_queues.find((entry) => entry.id === queueId && entry.active);
+    if (!queue) throw new Error(`Implementation Queue ${queueId} is not active`);
+    const entry = queue.entries.find(
+      (candidate) => candidate.position === position && !candidate.done && !candidate.skipped,
+    );
+    if (!entry) throw new Error(`Queue entry ${position} is not available`);
+    const source = state.runs.find((candidate) => candidate.id === sourceRunId);
+    if (!source) throw new Error(`Run ${sourceRunId} does not exist`);
+    try {
+      await launchQueueRun({
+        itemId: queue.itemId,
+        workspaceId: queue.workspaceId,
+        queueAttachment: { queueId, position },
+        strategy: {
+          kind: "direct",
+          machineId: source.machine_id,
+          primaryRepositoryId: queue.repositoryId,
+          agent: queue.configuration.agent,
+          configuration: queue.configuration,
+          executionProfile: "implement",
+          workflow: "matt-pocock",
+          prompt: queueEntryPrompt(entry, queue.specUrl),
+          promptSelection: { includeObjective: true, externalObjectIds: [] },
+          expectedCheckouts: source.direct_checkouts,
+          allowDirty: queue.allowDirty,
+          allowSharedCheckouts: queue.allowSharedCheckouts,
+        },
+      });
+    } catch (error) {
+      runtime.dispatch({
+        type: "pause_implementation_queue",
+        queueId,
+        reason: {
+          kind: "launch_failed",
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  };
+  const advanceFinishedQueueRun = async (runId: number) => {
+    const initial = runtime.snapshot();
+    const match = initial.implementation_queues
+      .filter((queue) => queue.active)
+      .flatMap((queue) => {
+        const entry = queue.entries.find(
+          (candidate) => candidate.runId === runId && !candidate.done && !candidate.skipped,
+        );
+        return entry ? [{ queue, entry }] : [];
+      })[0];
+    if (!match) return;
+    await withQueueLock(match.queue.id, async () => {
+      const state = runtime.snapshot();
+      const queue = state.implementation_queues.find(
+        (candidate) => candidate.id === match.queue.id && candidate.active,
+      );
+      const entry = queue?.entries.find(
+        (candidate) => candidate.runId === runId && !candidate.done && !candidate.skipped,
+      );
+      const run = state.runs.find((candidate) => candidate.id === runId);
+      if (!queue || !entry || !run) return;
+      if (run.state !== "finished")
+        throw new Error(`Run #${runId} must finish before the Implementation Queue can be checked`);
+      const item = state.items.find((candidate) => candidate.id === queue.itemId);
+      if (!item) throw new Error(`Item ${queue.itemId} does not exist`);
+      const project = state.projects.find((candidate) => candidate.id === item.project_id);
+      if (!project) throw new Error(`Project ${item.project_id} does not exist`);
+      const context = state.contexts.find((candidate) => candidate.id === project.context_id);
+      if (!context) throw new Error(`Context ${project.context_id} does not exist`);
+      const machine = state.machines.find((candidate) => candidate.id === run.machine_id);
+      if (!machine) return;
+      const linked = state.external_objects.find(
+        (object) => object.canonical_url === entry.ticketUrl,
+      );
+      const ticket = linked
+        ? {
+            provider: linked.provider,
+            kind: linked.kind,
+            external_key: linked.external_key,
+            canonical_url: linked.canonical_url,
+          }
+        : classifyUrl(entry.ticketUrl);
+      const localReference = ticket.external_key.startsWith("local:")
+        ? ticket.external_key
+        : entry.ticketUrl;
+      const local = await registeredLocalMarkdown(state, queue.itemId, localReference);
+      if (!local && ticket.provider === "generic")
+        throw new Error(`Queue ticket URL is not recognized: ${entry.ticketUrl}`);
+      const ticketSnapshot = local
+        ? await readMarkdownSnapshot(local.filename, Math.floor(Date.now() / 1000))
+        : await new ProviderDispatch(queueProviderConfig(context)).fetchSnapshot(
+            ticket,
+            Math.floor(Date.now() / 1000),
+          );
+      let checkoutClean = true;
+      if (context.check_dirty_checkouts) {
+        const git = new GitCli(machineAccess);
+        for (const checkout of run.direct_checkouts)
+          checkoutClean =
+            !(await git.inspectCheckout(machine, checkout.path)).isDirty && checkoutClean;
+      }
+      const current = runtime.snapshot();
+      const latestItem = current.items.find((candidate) => candidate.id === queue.itemId);
+      const latestProject =
+        latestItem && current.projects.find((candidate) => candidate.id === latestItem.project_id);
+      const latestContext =
+        latestProject &&
+        current.contexts.find((candidate) => candidate.id === latestProject.context_id);
+      if (latestContext?.check_dirty_checkouts !== context.check_dirty_checkouts)
+        throw new Error(
+          "Context dirty checkout setting changed while the queue was checked; check it again",
+        );
+      if (
+        JSON.stringify(
+          current.implementation_queues.find((candidate) => candidate.id === queue.id),
+        ) !== JSON.stringify(queue) ||
+        JSON.stringify(current.runs.find((candidate) => candidate.id === runId)) !==
+          JSON.stringify(run)
+      )
+        throw new Error(
+          "Implementation Queue or Run changed while the ticket was being checked; check it again",
+        );
+      const result = runtime.dispatchManyWithEffects([
+        {
+          type: "advance_implementation_queue",
+          queueId: queue.id,
+          runId,
+          ticketClosed: !implementationTicketIsOpen(ticketSnapshot.state),
+          checkoutClean,
+        },
+      ]);
+      if (result.effects.some((effect) => effect.type === "close_implementation_run_session"))
+        await terminalRuntime
+          .killSession(machine, run.session_name)
+          .catch((error) =>
+            console.error(
+              `Could not close finished Implementation Queue Run ${runId} session: ${String(error)}`,
+            ),
+          );
+      const launch = result.effects.find(
+        (effect) => effect.type === "launch_implementation_queue_entry",
+      );
+      if (launch?.type === "launch_implementation_queue_entry") {
+        const next = queue.entries.find((candidate) => candidate.position === launch.position);
+        if (next) await launchQueueEntry(queue.id, next.position, runId);
+      }
+    });
   };
   const reconcileRuns = async (): Promise<RunReconciliationResult> => {
     if (!runtime.beginReconciliation()) return { failures: [], changed: false };
@@ -224,6 +415,12 @@ export function createWorkCommandHandlers(
           changed = true;
           if (liveRun.state !== targetState)
             onRunStateChanged({ runId: run.id, state: targetState });
+          if (targetState === "finished")
+            void advanceFinishedQueueRun(run.id).catch((error) =>
+              console.error(
+                `Could not advance Implementation Queue for Run ${run.id}: ${String(error)}`,
+              ),
+            );
         }
       }
       for (const run of runtime
@@ -238,6 +435,25 @@ export function createWorkCommandHandlers(
         } catch (error) {
           console.error(
             `Could not capture Grill questions for Run ${run.id}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      for (const runId of runtime
+        .snapshot()
+        .implementation_queues.filter((queue) => queue.active)
+        .flatMap((queue) =>
+          queue.entries
+            .filter((entry) => !entry.done && !entry.skipped && entry.runId !== null)
+            .map((entry) => entry.runId!),
+        )
+        .filter((runId) =>
+          runtime.snapshot().runs.some((run) => run.id === runId && run.state === "finished"),
+        )) {
+        try {
+          await advanceFinishedQueueRun(runId);
+        } catch (error) {
+          console.error(
+            `Could not advance Implementation Queue for Run ${runId}: ${String(error)}`,
           );
         }
       }
@@ -271,6 +487,10 @@ export function createWorkCommandHandlers(
         : updated?.last_applied_agent_state_sequence === record.sequence &&
           previousSequence !== record.sequence;
     if (updated && updated.state !== oldState) onRunStateChanged({ runId, state: updated.state });
+    if (updated?.state === "finished" && updated.state !== oldState)
+      void advanceFinishedQueueRun(runId).catch((error) =>
+        console.error(`Could not advance Implementation Queue for Run ${runId}: ${String(error)}`),
+      );
     if (reportAccepted && (record.state === "blocked" || record.state === "finished")) {
       void reconcileRuns()
         .then(() => {
@@ -511,6 +731,69 @@ export function createWorkCommandHandlers(
     return worktreeValue(next, workspaceId, repositoryId);
   };
   return {
+    check_implementation_queue: async (args: Record<string, unknown>) => {
+      const queueId = Number(args.queueId);
+      const state = runtime.snapshot();
+      const queue = state.implementation_queues.find(
+        (entry) => entry.id === queueId && entry.active && entry.pausedReason !== null,
+      );
+      if (!queue) throw new Error(`Implementation Queue ${queueId} is not paused`);
+      const index = queue.entries.findIndex((entry) => !entry.done && !entry.skipped);
+      if (index < 0) throw new Error("Paused queue has no ticket to check");
+      const entry = queue.entries[index]!;
+      if (entry.runId !== null) return advanceFinishedQueueRun(entry.runId);
+      const sourceRunId =
+        queue.entries
+          .slice(0, index)
+          .reverse()
+          .find((candidate) => candidate.runId != null)?.runId ?? undefined;
+      if (sourceRunId === undefined)
+        throw new Error("Paused ticket has no previous Run context to retry its launch");
+      return withQueueLock(queue.id, () => launchQueueEntry(queue.id, entry.position, sourceRunId));
+    },
+    skip_implementation_queue_entry: async (args: Record<string, unknown>) => {
+      const queueId = Number(args.queueId);
+      return withQueueLock(queueId, async () => {
+        const before = runtime.snapshot();
+        const queue = before.implementation_queues.find(
+          (entry) => entry.id === queueId && entry.active && entry.pausedReason !== null,
+        );
+        if (!queue) throw new Error(`Implementation Queue ${queueId} is not paused`);
+        const index = queue.entries.findIndex((entry) => !entry.done && !entry.skipped);
+        if (index < 0) throw new Error("Paused queue has no ticket to skip");
+        const entry = queue.entries[index]!;
+        const sourceRunId =
+          entry.runId ??
+          queue.entries
+            .slice(0, index)
+            .reverse()
+            .find((candidate) => candidate.runId != null)?.runId ??
+          undefined;
+        const decision = runtime.dispatchManyWithEffects([
+          { type: "skip_implementation_queue_entry", queueId, position: entry.position },
+        ]);
+        const launch = decision.effects.find(
+          (effect) => effect.type === "launch_implementation_queue_entry",
+        );
+        if (launch?.type === "launch_implementation_queue_entry") {
+          if (sourceRunId === undefined)
+            throw new Error("Paused ticket has no previous Run context for the next launch");
+          const next = runtime
+            .snapshot()
+            .implementation_queues.find((candidate) => candidate.id === queueId)
+            ?.entries.find((candidate) => candidate.position === launch.position);
+          if (next) await launchQueueEntry(queueId, next.position, sourceRunId);
+        }
+        return null;
+      });
+    },
+    cancel_implementation_queue: (args: Record<string, unknown>) => {
+      const queueId = Number(args.queueId);
+      return withQueueLock(queueId, async () => {
+        runtime.dispatch({ type: "cancel_implementation_queue", queueId });
+        return null;
+      });
+    },
     submit_grill_answers: (args: Record<string, unknown>) =>
       withGrillLock(Number(args.runId), async () => {
         const runId = Number(args.runId);

@@ -34,6 +34,7 @@ export function encodeImplementationQueue(queue: ImplementationQueue): string {
     allowDirty: queue.allowDirty,
     allowSharedCheckouts: queue.allowSharedCheckouts,
     entries: queue.entries.map((entry) => ({
+      position: entry.position,
       ticketNumber: entry.ticketNumber,
       ticketTitle: entry.ticketTitle,
       ticketUrl: entry.ticketUrl,

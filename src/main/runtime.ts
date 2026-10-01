@@ -70,6 +70,12 @@ export class Runtime {
     return this.dispatchMany([event]);
   }
   dispatchMany(events: Event[]): DomainState {
+    return this.dispatchManyWithEffects(events).state;
+  }
+  dispatchManyWithEffects(events: Event[]): {
+    state: DomainState;
+    effects: import("../domain/events").Effect[];
+  } {
     let nextState = this.state;
     const effects = [] as import("../domain/events").Effect[];
     for (const event of events) {
@@ -80,7 +86,7 @@ export class Runtime {
     this.store.commit({ state: nextState, effects });
     this.state = nextState;
     this.ensureProjectWorkspaces();
-    return this.snapshot();
+    return { state: this.snapshot(), effects };
   }
 
   beginExternalSnapshotRequest(externalObjectId: number): number {
