@@ -17,11 +17,11 @@
   "scripts": {
     "dev": "vp build --config vite.main.config.ts && vp build --config vite.preload.config.ts && concurrently -k \"vp dev --host 127.0.0.1\" \"wait-on tcp:5173 && cross-env ELECTRON_RENDERER_URL=http://127.0.0.1:5173 electron .\"",
     "start": "electron .",
-    "build": "vp build --config vite.main.config.ts && vp build --config vite.preload.config.ts && vp build",
+    "build": "node scripts/build-resources.mjs && vp build --config vite.main.config.ts && vp build --config vite.preload.config.ts && vp build",
     "package": "npm run build && electron-forge package",
     "make": "npm run build && electron-forge make",
-    "check": "vp check src vite.config.ts vite.main.config.ts vite.preload.config.ts forge.config.cjs package.json README.md tsconfig.json && tsc --noEmit",
-    "test": "vp test && tsc --noEmit"
+    "check": "node scripts/build-resources.mjs && vp check src vite.config.ts vite.main.config.ts vite.preload.config.ts forge.config.cjs package.json README.md tsconfig.json && tsc --noEmit",
+    "test": "node scripts/build-resources.mjs && node --test scripts/check-pstack-vendor.test.mjs && node scripts/check-pstack-vendor.mjs && vp test && tsc --noEmit"
   },
   "devDependencies": {
     "@electron-forge/cli": "^8.0.1",
