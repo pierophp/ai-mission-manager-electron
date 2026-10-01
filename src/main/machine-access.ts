@@ -10,9 +10,19 @@ export type MachineProbe = Pick<
   "reachable" | "tmuxAvailable" | "bunAvailable" | "bunError" | "stateDirectoryWritable" | "error"
 >;
 
-export type MachineCommandResult = { stdout: Buffer; stderr: Buffer; code: number };
+export type MachineCommandResult = {
+  stdout: Buffer;
+  stderr: Buffer;
+  code: number;
+  timedOut?: boolean;
+};
 export interface MachineAccess {
-  runShell(machine: Machine, command: string, input?: Uint8Array): Promise<string>;
+  runShell(
+    machine: Machine,
+    command: string,
+    input?: Uint8Array,
+    timeoutMs?: number,
+  ): Promise<string>;
   machineHome(machine: Machine): Promise<string>;
   findExecutable(machine: Machine, name: string): Promise<string>;
   writeFile(machine: Machine, target: string, contents: Uint8Array): Promise<void>;
@@ -49,17 +59,39 @@ export function buildStateDirectoryProbeCommand(): string {
   return 'set -eu; state_dir="$HOME/.local/state/ai-mission-manager/runs"; umask 077; mkdir -p "$state_dir"; temporary="$state_dir/.preflight.$$"; (set -C; : > "$temporary"); rm -f "$temporary"';
 }
 
-function run(program: string, args: string[], input?: Uint8Array): Promise<MachineCommandResult> {
+function run(
+  program: string,
+  args: string[],
+  input?: Uint8Array,
+  timeoutMs?: number,
+): Promise<MachineCommandResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(program, args, { stdio: ["pipe", "pipe", "pipe"] });
+    let timedOut = false;
+    const timer =
+      timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            child.kill("SIGKILL");
+          }, timeoutMs);
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.once("error", reject);
-    child.once("close", (code) =>
-      resolve({ stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr), code: code ?? 1 }),
-    );
+    child.once("error", (error) => {
+      if (timer) clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      if (timer) clearTimeout(timer);
+      resolve({
+        stdout: Buffer.concat(stdout),
+        stderr: Buffer.concat(stderr),
+        code: code ?? 1,
+        timedOut,
+      });
+    });
     child.stdin.end(input ? Buffer.from(input) : undefined);
   });
 }
@@ -67,11 +99,16 @@ function run(program: string, args: string[], input?: Uint8Array): Promise<Machi
 export class LocalSshMachineAccess implements MachineAccess {
   constructor(private readonly runner = run) {}
 
-  async runShell(machine: Machine, command: string, input?: Uint8Array): Promise<string> {
+  async runShell(
+    machine: Machine,
+    command: string,
+    input?: Uint8Array,
+    timeoutMs?: number,
+  ): Promise<string> {
     const { program, args } = buildMachineShellArgv(machine.transport, command);
     let result: MachineCommandResult;
     try {
-      result = await this.runner(program, args, input);
+      result = await this.runner(program, args, input, timeoutMs);
     } catch (error) {
       const verb = machine.transport.kind === "ssh" ? "connect to" : "inspect";
       throw new Error(
@@ -79,6 +116,10 @@ export class LocalSshMachineAccess implements MachineAccess {
       );
     }
     if (result.code !== 0) {
+      if (result.timedOut)
+        throw new Error(
+          `Timed out after ${Math.ceil((timeoutMs ?? 0) / 1000)} seconds stopping a Run pane on Machine ${machine.name}`,
+        );
       const detail = result.stderr.toString("utf8").trim();
       throw new Error(detail || `command exited with ${result.code}`);
     }
@@ -243,7 +284,12 @@ export class FakeMachineAccess implements MachineAccess {
       error: null as string | null,
     },
   ) {}
-  async runShell(machine: Machine, command: string, input?: Uint8Array): Promise<string> {
+  async runShell(
+    machine: Machine,
+    command: string,
+    input?: Uint8Array,
+    _timeoutMs?: number,
+  ): Promise<string> {
     this.calls.push({ machineId: machine.id, operation: "shell", command, input });
     this.onShellStart?.();
     await this.shellGate;

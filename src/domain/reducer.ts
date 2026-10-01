@@ -1,6 +1,7 @@
 import { DomainError } from "./error";
 import { defaultPstackRoles, type DomainState } from "./model";
 import { cleanMachineTransport } from "./machine-transport";
+import { pathIsWithin } from "./paths";
 import type {
   Context,
   ContextAttentionDefault,
@@ -563,6 +564,173 @@ export function decide(state: DomainState, event: Event): Decision {
       machine.last_observed = event.observation;
       machine.last_observed_at = event.observedAt;
       effects.push({ type: "persist_machine_observation", machine: structuredClone(machine) });
+      break;
+    }
+    case "observe_run": {
+      const run = next.runs.find((candidate) => candidate.id === event.runId);
+      if (!run) throw new DomainError(`Run ${event.runId} does not exist`);
+      const validSequence = event.sequence === null || event.sequence >= 0;
+      const acceptsState =
+        validSequence &&
+        (event.sequence === null
+          ? run.last_applied_agent_state_sequence == null
+          : run.last_applied_agent_state_sequence == null ||
+            event.sequence > run.last_applied_agent_state_sequence);
+      if (acceptsState && event.sequence !== null)
+        run.last_applied_agent_state_sequence = event.sequence;
+      if (acceptsState && run.state !== event.state) {
+        run.state = event.state;
+        if (run.execution_profile === "plan") {
+          if (run.plan_phase === "executing") run.plan_phase = "executing";
+          else run.plan_phase = event.state === "finished" ? "awaitingGo" : null;
+        }
+        if (run.execution_profile === "grill") {
+          run.grill_phase =
+            event.state === "unknown"
+              ? (run.grill_phase ?? "starting")
+              : event.state === "working"
+                ? "working"
+                : event.state === "blocked"
+                  ? "waitingForAnswers"
+                  : run.grill_question_group && run.grill_response === null
+                    ? "waitingForAnswers"
+                    : "awaitingNextAction";
+        }
+      }
+      run.pane_status = event.paneStatus;
+      effects.push({ type: "persist_run_observation", run: structuredClone(run) });
+      if (run.execution_profile === "grill") {
+        if (event.paneStatus === "missing" && runIsActive(run)) {
+          run.grill_phase = "recoverablePaneLoss";
+          effects[effects.length - 1] = {
+            type: "persist_run_observation",
+            run: structuredClone(run),
+          };
+        } else if (
+          event.paneStatus === "available" &&
+          (run.grill_phase === null || run.grill_phase === "recoverablePaneLoss")
+        ) {
+          run.grill_phase =
+            run.state === "unknown"
+              ? "starting"
+              : run.state === "working"
+                ? "working"
+                : run.state === "blocked"
+                  ? "waitingForAnswers"
+                  : run.grill_question_group && run.grill_response === null
+                    ? "waitingForAnswers"
+                    : "awaitingNextAction";
+          effects[effects.length - 1] = {
+            type: "persist_run_observation",
+            run: structuredClone(run),
+          };
+        }
+      }
+      if (event.paneStatus === "missing") {
+        const queue = next.implementation_queues.find(
+          (candidate) =>
+            candidate.active &&
+            candidate.entries.some((entry) => entry.runId === run.id && !entry.done),
+        );
+        if (queue) {
+          queue.pausedReason = { kind: "pane_missing" };
+          effects.push({ type: "persist_implementation_queue", queue: structuredClone(queue) });
+        }
+      }
+      break;
+    }
+    case "attach_untracked_run": {
+      const item = next.items.find((entry) => entry.id === event.itemId);
+      if (!item) throw new DomainError(`Item ${event.itemId} does not exist`);
+      const workspace = next.workspaces.find(
+        (entry) => entry.id === event.workspaceId && entry.item_id === item.id,
+      );
+      if (!workspace)
+        throw new DomainError(`Workspace ${event.workspaceId} does not exist for Item ${item.id}`);
+      const repository = next.repositories.find((entry) => entry.id === event.repositoryId);
+      if (!repository) throw new DomainError(`Repository ${event.repositoryId} does not exist`);
+      if (repository.project_id !== item.project_id)
+        throw new DomainError(
+          `Repository ${event.repositoryId} does not belong to Item ${item.id}'s Project`,
+        );
+      const machine = next.machines.find((entry) => entry.id === event.machineId);
+      if (!machine) throw new DomainError(`Machine ${event.machineId} does not exist`);
+      const project = next.projects.find((entry) => entry.id === item.project_id);
+      const context = project && next.contexts.find((entry) => entry.id === project.context_id);
+      if (!context) throw new DomainError(`Context for Item ${item.id} does not exist`);
+      if (context.execution_machine_id !== machine.id)
+        throw new DomainError(
+          `Machine ${machine.id} is not the execution Machine configured for Context ${context.id}`,
+        );
+      const worktree =
+        event.worktreeId == null
+          ? null
+          : next.worktrees.find((entry) => entry.id === event.worktreeId);
+      if (
+        event.worktreeId != null &&
+        (!worktree ||
+          worktree.workspaceId !== workspace.id ||
+          worktree.repositoryId !== repository.id ||
+          worktree.path !== event.workingDirectory)
+      )
+        throw new DomainError(`Run working directory does not match Repository ${repository.id}`);
+      if (event.worktreeId == null) {
+        const location = next.repository_locations.find(
+          (entry) => entry.repository_id === repository.id && entry.machine_id === machine.id,
+        );
+        if (
+          !location ||
+          !pathIsWithin(location.checkout_path, event.workingDirectory, event.machineHome)
+        )
+          throw new DomainError(`Run working directory does not match Repository ${repository.id}`);
+      }
+      if (
+        next.runs.some(
+          (run) =>
+            run.machine_id === machine.id &&
+            run.session_name === event.sessionName &&
+            run.pane_id === event.paneId,
+        )
+      )
+        throw new DomainError("The suggested agent is already attached to a Run");
+      const id = next.next_run_id++;
+      const run: import("./execution-types").Run = {
+        id,
+        item_id: item.id,
+        workspace_id: workspace.id,
+        repository_id: event.repositoryId,
+        worktree_id: event.worktreeId,
+        machine_id: machine.id,
+        agent: event.agent,
+        cli_configuration_profile: null,
+        execution_profile: "custom",
+        workflow: "matt-pocock",
+        model: null,
+        effort: null,
+        skill_snapshot: null,
+        prompt: "Attached existing agent",
+        working_directory: event.workingDirectory,
+        session_name: event.sessionName,
+        pane_id: event.paneId,
+        started_at: event.startedAt,
+        state: "unknown",
+        last_applied_agent_state_sequence: null,
+        pane_status: "available",
+        direct_checkouts: [],
+        transcript: "",
+        reported_pull_requests: [],
+        attention_summary: null,
+        grill_question_group: null,
+        grill_answers: [],
+        grill_decisions: [],
+        grill_response: null,
+        grill_phase: null,
+        grill_action: null,
+        plan_phase: null,
+        plan_path: null,
+      };
+      next.runs.push(run);
+      effects.push({ type: "persist_run", run: structuredClone(run), nextRunId: next.next_run_id });
       break;
     }
     case "set_context_execution_machine": {

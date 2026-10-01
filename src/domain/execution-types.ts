@@ -140,6 +140,15 @@ export type RunSuggestion = {
   locationPath?: string | null;
 };
 
+export type AgentPaneObservation = {
+  machineId: number;
+  agent: AgentKind;
+  sessionName: string;
+  paneId: string;
+  currentPath: string;
+  machineHome: string;
+};
+
 export type RunPromptSelection = {
   includeObjective: boolean;
   externalObjectIds: number[];

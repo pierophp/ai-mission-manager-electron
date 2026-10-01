@@ -5,11 +5,151 @@ import type { Runtime } from "./runtime";
 import { LocalSshMachineAccess, type MachineAccess } from "./machine-access";
 import { GitCli } from "./git";
 import { normalizeMachinePath, resolveMachinePath, worktreePath } from "./machine-path";
+import { suggestUntrackedRuns } from "../domain/run-suggestions";
+import type { RunSuggestion } from "../domain/execution-types";
+import { TmuxTerminalRuntime, type AgentStateRecord, type TerminalRuntime } from "./terminal";
+import type { RunReconciliationResult, MachineObservationFailure } from "../domain/types";
+
+function sameSuggestion(left: RunSuggestion, right: RunSuggestion): boolean {
+  return (
+    left.machineId === right.machineId &&
+    left.agent === right.agent &&
+    left.sessionName === right.sessionName &&
+    left.paneId === right.paneId &&
+    left.currentPath === right.currentPath &&
+    left.itemId === right.itemId &&
+    left.contextId === right.contextId &&
+    left.workspaceId === right.workspaceId &&
+    left.repositoryId === right.repositoryId &&
+    left.worktreeId === right.worktreeId &&
+    left.locationPath === right.locationPath
+  );
+}
 
 export function createWorkCommandHandlers(
   runtime: Runtime,
   machineAccess: MachineAccess = new LocalSshMachineAccess(),
+  terminalRuntime: TerminalRuntime = new TmuxTerminalRuntime(machineAccess),
+  onRunStateChanged: (event: { runId: number; state: string }) => void = () => undefined,
 ) {
+  const reconcileRuns = async (): Promise<RunReconciliationResult> => {
+    if (!runtime.beginReconciliation()) return { failures: [], changed: false };
+    try {
+      const snapshot = runtime.snapshot();
+      const machines = new Map<number, (typeof snapshot.machines)[number]>();
+      for (const run of snapshot.runs) {
+        const machine = snapshot.machines.find((candidate) => candidate.id === run.machine_id);
+        if (machine) machines.set(machine.id, machine);
+      }
+      const observations = new Map<
+        number,
+        Awaited<ReturnType<TerminalRuntime["observeMachine"]>>
+      >();
+      const failures: MachineObservationFailure[] = [];
+      for (const machine of machines.values()) {
+        const ids = snapshot.runs
+          .filter((run) => run.machine_id === machine.id)
+          .map((run) => run.id);
+        const observation = await terminalRuntime.observeMachine(machine, ids);
+        observations.set(machine.id, observation);
+        if (!(observation.panes instanceof Array))
+          failures.push({
+            machineId: machine.id,
+            machineName: machine.name,
+            kind: observation.panes.kind,
+            message: observation.panes.error,
+          });
+      }
+      let changed = false;
+      for (const run of snapshot.runs) {
+        const machine = machines.get(run.machine_id);
+        const observation = observations.get(run.machine_id);
+        if (!machine || !observation) continue;
+        const current = runtime.snapshot();
+        const liveRun = current.runs.find((candidate) => candidate.id === run.id);
+        const liveMachine = current.machines.find((candidate) => candidate.id === machine.id);
+        if (
+          !liveRun ||
+          JSON.stringify(liveMachine) !== JSON.stringify(machine) ||
+          liveRun.machine_id !== run.machine_id ||
+          liveRun.session_name !== run.session_name ||
+          liveRun.pane_id !== run.pane_id ||
+          liveRun.agent !== run.agent
+        )
+          continue;
+        const panes = observation.panes;
+        const isUnreachable = !(panes instanceof Array) && panes.kind === "unreachable";
+        let paneStatus = run.pane_status;
+        if (panes instanceof Array) {
+          const exact = panes.some(
+            (pane) => pane.sessionName === run.session_name && pane.paneId === run.pane_id,
+          );
+          const samePane = panes.some((pane) => pane.paneId === run.pane_id);
+          if (exact) paneStatus = "available";
+          else if (!samePane) paneStatus = "missing";
+        } else paneStatus = "unknown";
+        const paneRecords =
+          panes instanceof Array
+            ? panes
+                .filter(
+                  (pane) => pane.sessionName === run.session_name && pane.paneId === run.pane_id,
+                )
+                .map((pane) => pane.agentState)
+                .filter(
+                  (record): record is AgentStateRecord =>
+                    record !== null &&
+                    Number(record.runId) === run.id &&
+                    record.agent === run.agent &&
+                    (record.sequence === undefined || record.sequence >= 0),
+                )
+            : [];
+        const paneRecord = paneRecords.sort((a, b) => (b.sequence ?? -1) - (a.sequence ?? -1))[0];
+        const fileRecord = observation.stateRecords
+          .filter(
+            (record) =>
+              Number(record.runId) === run.id &&
+              record.agent === run.agent &&
+              (record.sequence === undefined || record.sequence >= 0),
+          )
+          .sort((a, b) => (b.sequence ?? -1) - (a.sequence ?? -1))[0];
+        const record =
+          fileRecord && (!paneRecord || (fileRecord.sequence ?? -1) > (paneRecord.sequence ?? -1))
+            ? fileRecord
+            : paneRecord;
+        const stateAccepted =
+          !isUnreachable &&
+          record !== undefined &&
+          (record.sequence === undefined
+            ? liveRun.last_applied_agent_state_sequence == null
+            : record.sequence >= 0 &&
+              (liveRun.last_applied_agent_state_sequence == null ||
+                record.sequence > liveRun.last_applied_agent_state_sequence));
+        const targetState = stateAccepted ? record!.state : liveRun.state;
+        const sequence = stateAccepted
+          ? (record!.sequence ?? null)
+          : (liveRun.last_applied_agent_state_sequence ?? null);
+        if (
+          liveRun.pane_status !== paneStatus ||
+          liveRun.state !== targetState ||
+          (sequence !== null && sequence > (liveRun.last_applied_agent_state_sequence ?? -1))
+        ) {
+          runtime.dispatch({
+            type: "observe_run",
+            runId: run.id,
+            state: targetState,
+            sequence,
+            paneStatus,
+          });
+          changed = true;
+          if (liveRun.state !== targetState)
+            onRunStateChanged({ runId: run.id, state: targetState });
+        }
+      }
+      return { failures, changed };
+    } finally {
+      runtime.endReconciliation();
+    }
+  };
   const updateItem = (event: Event, itemId: number): Item => {
     const state = runtime.dispatch(event);
     const item = state.items.find((candidate) => candidate.id === itemId);
@@ -211,6 +351,114 @@ export function createWorkCommandHandlers(
     return worktreeValue(next, workspaceId, repositoryId);
   };
   return {
+    reconcile_runs: reconcileRuns,
+    list_run_suggestions: async (): Promise<RunSuggestion[]> => {
+      const snapshot = runtime.snapshot();
+      const machines = snapshot.machines.filter((machine) =>
+        snapshot.contexts.some((context) => context.execution_machine_id === machine.id),
+      );
+      const observations = [];
+      for (const machine of machines) {
+        try {
+          const [panes, machineHome] = await Promise.all([
+            terminalRuntime.listAgentPanes(machine),
+            machineAccess.machineHome(machine),
+          ]);
+          observations.push(
+            ...panes.map((pane) => ({
+              machineId: machine.id,
+              agent: pane.agent,
+              sessionName: pane.sessionName,
+              paneId: pane.paneId,
+              currentPath: pane.currentPath,
+              machineHome,
+            })),
+          );
+        } catch (error) {
+          console.error(
+            `Could not inspect Machine ${machine.name} for agent Panes: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (JSON.stringify(runtime.snapshot()) !== JSON.stringify(snapshot))
+        throw new Error(
+          "Run or Machine state changed while agent Panes were inspected; refresh suggestions again",
+        );
+      return suggestUntrackedRuns(snapshot, observations);
+    },
+    attach_run: async (args: Record<string, unknown>) => {
+      const suggestion = args.suggestion as RunSuggestion;
+      const candidates = await (async () => {
+        const state = runtime.snapshot();
+        const machine = state.machines.find((entry) => entry.id === suggestion.machineId);
+        if (!machine) throw new Error(`Machine ${suggestion.machineId} does not exist`);
+        const [panes, machineHome] = await Promise.all([
+          terminalRuntime.listAgentPanes(machine),
+          machineAccess.machineHome(machine),
+        ]);
+        return suggestUntrackedRuns(
+          state,
+          panes
+            .filter(
+              (pane) =>
+                pane.agent === suggestion.agent &&
+                pane.sessionName === suggestion.sessionName &&
+                pane.paneId === suggestion.paneId,
+            )
+            .map((pane) => ({ machineId: machine.id, ...pane, machineHome })),
+        );
+      })();
+      const canonical = candidates.find((candidate) => sameSuggestion(candidate, suggestion));
+      if (!canonical)
+        throw new Error(
+          "The suggested agent or its registered working location changed while it was inspected; refresh suggestions",
+        );
+      const attachMachine = runtime
+        .snapshot()
+        .machines.find((machine) => machine.id === canonical.machineId);
+      if (!attachMachine) throw new Error(`Machine ${canonical.machineId} does not exist`);
+      const machineHome = await machineAccess.machineHome(attachMachine);
+      const latest = runtime.snapshot();
+      const refreshed = suggestUntrackedRuns(latest, [
+        {
+          machineId: attachMachine.id,
+          agent: canonical.agent,
+          sessionName: canonical.sessionName,
+          paneId: canonical.paneId,
+          currentPath: canonical.currentPath,
+          machineHome,
+        },
+      ]).find((candidate) => sameSuggestion(candidate, canonical));
+      if (
+        !refreshed ||
+        JSON.stringify(latest.machines.find((machine) => machine.id === attachMachine.id)) !==
+          JSON.stringify(attachMachine)
+      )
+        throw new Error(
+          "The suggested agent or its registered working location changed while it was inspected; refresh suggestions",
+        );
+      const state = runtime.dispatch({
+        type: "attach_untracked_run",
+        itemId: canonical.itemId,
+        workspaceId: canonical.workspaceId!,
+        repositoryId: canonical.repositoryId!,
+        worktreeId: canonical.worktreeId ?? null,
+        machineId: canonical.machineId,
+        agent: canonical.agent,
+        workingDirectory: canonical.locationPath ?? canonical.currentPath,
+        machineHome,
+        sessionName: canonical.sessionName,
+        paneId: canonical.paneId,
+        startedAt: Math.floor(Date.now() / 1000),
+      });
+      const run = state.runs.at(-1);
+      if (!run) throw new Error("Run attachment produced no Run");
+      return run;
+    },
+    stop_untracked_agent: async (args: Record<string, unknown>) =>
+      controlUntrackedAgent(args.suggestion as RunSuggestion, false),
+    delete_untracked_agent: async (args: Record<string, unknown>) =>
+      controlUntrackedAgent(args.suggestion as RunSuggestion, true),
     get_home: (args: Record<string, unknown>) =>
       homeView(
         runtime.snapshot(),
@@ -299,4 +547,51 @@ export function createWorkCommandHandlers(
     prepare_worktree: prepareWorktree,
     attach_worktree: attachWorktree,
   };
+
+  async function controlUntrackedAgent(suggestion: RunSuggestion, remove: boolean): Promise<null> {
+    const state = runtime.snapshot();
+    const machine = state.machines.find((entry) => entry.id === suggestion.machineId);
+    if (!machine) throw new Error(`Machine ${suggestion.machineId} does not exist`);
+    const [panes, machineHome] = await Promise.all([
+      terminalRuntime.listAgentPanes(machine),
+      machineAccess.machineHome(machine),
+    ]);
+    const canonical = suggestUntrackedRuns(
+      state,
+      panes
+        .filter(
+          (pane) =>
+            pane.agent === suggestion.agent &&
+            pane.sessionName === suggestion.sessionName &&
+            pane.paneId === suggestion.paneId,
+        )
+        .map((pane) => ({ machineId: machine.id, ...pane, machineHome })),
+    ).find((candidate) => sameSuggestion(candidate, suggestion));
+    if (!canonical)
+      throw new Error(
+        "The suggested agent or its registered working location changed while it was inspected; refresh suggestions",
+      );
+    if (remove) await terminalRuntime.killPane(machine, canonical.sessionName, canonical.paneId);
+    else await terminalRuntime.interruptPane(machine, canonical.sessionName, canonical.paneId);
+    const latest = runtime.snapshot();
+    const stillCurrent = suggestUntrackedRuns(latest, [
+      {
+        machineId: machine.id,
+        agent: canonical.agent,
+        sessionName: canonical.sessionName,
+        paneId: canonical.paneId,
+        currentPath: canonical.currentPath,
+        machineHome,
+      },
+    ]).some((candidate) => sameSuggestion(candidate, canonical));
+    if (
+      !stillCurrent ||
+      JSON.stringify(latest.machines.find((entry) => entry.id === machine.id)) !==
+        JSON.stringify(machine)
+    )
+      throw new Error(
+        "The agent Pane was controlled, but its registered working location changed before the operation completed",
+      );
+    return null;
+  }
 }

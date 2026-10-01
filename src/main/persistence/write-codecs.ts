@@ -1,8 +1,51 @@
-import type { Context } from "../../domain/types";
+import type { Context, ImplementationQueue } from "../../domain/types";
 import type { MachineTransport } from "../../domain/types";
 import type { ItemRelation } from "../../domain/types";
 import type { Activity, ExternalMetadata } from "../../domain/types";
 import type { ExternalLink } from "../../domain/types";
+import type { GrillPhase, PlanPhase } from "../../domain/execution-types";
+
+function encodePhase(phase: string | null): string | null {
+  if (phase === null) return null;
+  return phase.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+}
+
+export function encodeGrillPhase(phase: GrillPhase | null): string | null {
+  return encodePhase(phase);
+}
+
+export function encodePlanPhase(phase: PlanPhase | null): string | null {
+  return encodePhase(phase);
+}
+
+export function encodeImplementationQueue(queue: ImplementationQueue): string {
+  return JSON.stringify({
+    id: queue.id,
+    itemId: queue.itemId,
+    specExternalObjectId: queue.specExternalObjectId,
+    specUrl: queue.specUrl,
+    workspaceId: queue.workspaceId,
+    repositoryId: queue.repositoryId,
+    configuration: {
+      agent: queue.configuration.agent,
+      model: queue.configuration.model,
+      effort: queue.configuration.effort,
+    },
+    allowDirty: queue.allowDirty,
+    allowSharedCheckouts: queue.allowSharedCheckouts,
+    entries: queue.entries.map((entry) => ({
+      ticketNumber: entry.ticketNumber,
+      ticketTitle: entry.ticketTitle,
+      ticketUrl: entry.ticketUrl,
+      ticketState: entry.ticketState,
+      runId: entry.runId,
+      done: entry.done,
+      skipped: entry.skipped ?? false,
+    })),
+    active: queue.active,
+    pausedReason: queue.pausedReason,
+  });
+}
 
 /** Serializes the Rust internally-tagged enum and variant fields in declaration order. */
 export function encodeMachineTransport(transport: MachineTransport): string {

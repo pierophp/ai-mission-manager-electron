@@ -97,6 +97,27 @@ export type Event =
       observation: Machine["last_observed"];
       observedAt: number;
     }
+  | {
+      type: "observe_run";
+      runId: number;
+      state: import("./execution-types").RunState;
+      sequence: number | null;
+      paneStatus: import("./execution-types").RunPaneStatus;
+    }
+  | {
+      type: "attach_untracked_run";
+      itemId: number;
+      workspaceId: number;
+      repositoryId: number;
+      worktreeId: number | null;
+      machineId: number;
+      agent: import("./execution-types").AgentKind;
+      workingDirectory: string;
+      machineHome: string;
+      sessionName: string;
+      paneId: string;
+      startedAt: number;
+    }
   | { type: "set_context_execution_machine"; contextId: number; machineId: number | null }
   | {
       type: "create_cli_configuration_profile";
@@ -206,6 +227,9 @@ export type Effect =
   | { type: "persist_machine"; machine: Machine; nextMachineId: number }
   | { type: "update_machine"; machine: Machine }
   | { type: "persist_machine_observation"; machine: Machine }
+  | { type: "persist_run_observation"; run: import("./execution-types").Run }
+  | { type: "persist_run"; run: import("./execution-types").Run; nextRunId: number }
+  | { type: "persist_implementation_queue"; queue: import("./types").ImplementationQueue }
   | {
       type: "persist_cli_configuration_profile";
       profile: CliConfigurationProfile;

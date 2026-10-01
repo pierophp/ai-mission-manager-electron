@@ -13,6 +13,7 @@ import { Runtime } from "./main/runtime";
 import { openSqliteStore, type SqliteStore } from "./main/persistence/sqlite-store";
 import { ensureProjectWorkspaces, recoverRunStateRecords } from "./main/persistence/startup";
 import { LocalSshMachineAccess } from "./main/machine-access";
+import { TmuxTerminalRuntime } from "./main/terminal";
 
 const execFileAsync = promisify(execFile);
 const hasSingleInstance = app.requestSingleInstanceLock();
@@ -139,14 +140,21 @@ if (!hasSingleInstance) {
       const state = store.loadState();
       const runtime = new Runtime(store, state);
       const machineAccess = new LocalSshMachineAccess();
+      const terminalRuntime = new TmuxTerminalRuntime(
+        machineAccess,
+        store.setting("tmux_executable_path") ?? "tmux",
+      );
       ensureProjectWorkspaces(runtime);
-      recoverRunStateRecords(runtime.snapshot());
+      recoverRunStateRecords(runtime, store.path);
       registerIpc(
         createCommandDispatcher({
           ...createReadCommandHandlers(store),
           ...createSetupCommandHandlers(runtime, store),
           ...createStructureCommandHandlers(runtime, machineAccess, store),
-          ...createWorkCommandHandlers(runtime, machineAccess),
+          ...createWorkCommandHandlers(runtime, machineAccess, terminalRuntime, (event) => {
+            for (const window of BrowserWindow.getAllWindows())
+              window.webContents.send("run-state-changed", event);
+          }),
           ...createExternalCommandHandlers(runtime),
           ...createDeletionCommandHandlers(runtime, machineAccess),
         }),

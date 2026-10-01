@@ -6,6 +6,7 @@ import type { SqliteStore } from "./persistence/sqlite-store";
 
 export class Runtime {
   private state: DomainState;
+  private reconciliationInProgress = false;
   private readonly externalSnapshotRequestGenerations = new Map<number, number>();
   private readonly externalSnapshotAppliedGenerations = new Map<number, number>();
   constructor(
@@ -16,6 +17,14 @@ export class Runtime {
   }
   snapshot(): DomainState {
     return structuredClone(this.state);
+  }
+  beginReconciliation(): boolean {
+    if (this.reconciliationInProgress) return false;
+    this.reconciliationInProgress = true;
+    return true;
+  }
+  endReconciliation(): void {
+    this.reconciliationInProgress = false;
   }
   auditEntryCount(): number {
     return this.store.auditEntryCount();

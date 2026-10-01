@@ -38,6 +38,9 @@ import {
   encodeRepositoryRegisteredAudit,
   encodeExternalMetadata,
   encodeExternalChanges,
+  encodeGrillPhase,
+  encodePlanPhase,
+  encodeImplementationQueue,
   encodeLinkProvenance,
 } from "./write-codecs";
 import { getSetupState, newContextConfiguration, readSetting } from "./settings";
@@ -278,6 +281,75 @@ export class SqliteStore {
           effect.machine.last_observed_at,
           effect.machine.id,
         );
+        break;
+      case "persist_run_observation":
+        db.prepare(
+          "UPDATE runs SET state=?,last_applied_agent_state_sequence=?,pane_status=?,grill_phase=?,plan_phase=? WHERE id=?",
+        ).run(
+          effect.run.state,
+          effect.run.last_applied_agent_state_sequence ?? null,
+          effect.run.pane_status,
+          encodeGrillPhase(effect.run.grill_phase ?? null),
+          encodePlanPhase(effect.run.plan_phase ?? null),
+          effect.run.id,
+        );
+        break;
+      case "persist_run": {
+        const run = effect.run;
+        db.prepare(
+          `INSERT INTO runs(
+            id,item_id,workspace_id,repository_id,worktree_id,machine_id,agent,cli_configuration_profile_json,
+            execution_profile,workflow,model,effort,skill_snapshot,prompt,working_directory,session_name,pane_id,
+            started_at,state,last_applied_agent_state_sequence,pane_status,direct_checkouts_json,transcript,
+            reported_pull_requests_json,attention_summary,grill_question_group_json,grill_answers_json,
+            grill_decisions_json,grill_response,grill_phase,grill_action,grill_action_started_at,
+            implementation_queue_id,implementation_queue_position,plan_phase,plan_path
+          ) VALUES(${Array(36).fill("?").join(",")})`,
+        ).run(
+          run.id,
+          run.item_id,
+          run.workspace_id,
+          run.repository_id,
+          run.worktree_id,
+          run.machine_id,
+          run.agent,
+          run.cli_configuration_profile ? JSON.stringify(run.cli_configuration_profile) : null,
+          run.execution_profile,
+          run.workflow,
+          run.model,
+          run.effort,
+          run.skill_snapshot,
+          run.prompt,
+          run.working_directory,
+          run.session_name,
+          run.pane_id,
+          run.started_at,
+          run.state,
+          run.last_applied_agent_state_sequence ?? null,
+          run.pane_status,
+          JSON.stringify(run.direct_checkouts),
+          run.transcript,
+          JSON.stringify(run.reported_pull_requests),
+          run.attention_summary,
+          run.grill_question_group ? JSON.stringify(run.grill_question_group) : null,
+          JSON.stringify(run.grill_answers),
+          JSON.stringify(run.grill_decisions),
+          run.grill_response,
+          encodeGrillPhase(run.grill_phase),
+          run.grill_action,
+          null,
+          null,
+          null,
+          encodePlanPhase(run.plan_phase),
+          run.plan_path,
+        );
+        db.prepare("UPDATE metadata SET value=? WHERE key='next_run_id'").run(effect.nextRunId);
+        break;
+      }
+      case "persist_implementation_queue":
+        db.prepare(
+          "INSERT INTO implementation_queues(id,item_id,queue_json) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET queue_json=excluded.queue_json",
+        ).run(effect.queue.id, effect.queue.itemId, encodeImplementationQueue(effect.queue));
         break;
       case "persist_cli_configuration_profile":
         db.prepare(
