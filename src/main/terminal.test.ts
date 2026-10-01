@@ -1,7 +1,13 @@
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { Machine } from "../domain/types";
 import {
   buildStateFileReadCommand,
+  buildPaneAttachCommand,
+  buildTerminalAppleScript,
+  decodeControlOutput,
   FakeTerminalConnection,
   parseAgentPanes,
   parsePaneSummary,
@@ -9,9 +15,137 @@ import {
   parseStateFilesRead,
   parseTmuxPanes,
   TmuxTerminalRuntime,
+  TmuxControlConnection,
+  TerminalCallbackGate,
 } from "./terminal";
 
 describe("tmux observations", () => {
+  it("buffers only post-snapshot output and holds state and exit until activation", () => {
+    const gate = new TerminalCallbackGate();
+    const outputs: number[][] = [];
+    const states: string[] = [];
+    const exits: (number | null)[] = [];
+    gate.dispatchOutput(new Uint8Array([1]), (data) => outputs.push([...data]));
+    gate.markSnapshotCaptured();
+    gate.dispatchOutput(new Uint8Array([2]), (data) => outputs.push([...data]));
+    gate.dispatchState(
+      { agent: "codex", runId: "3", state: "working", updatedAt: "now" },
+      (record) => states.push(record.state),
+    );
+    gate.dispatchExit(0, (code) => exits.push(code));
+    const pending = gate.activateAndDrain();
+    expect(pending.terminalEvents).toEqual([
+      { kind: "output", data: new Uint8Array([2]) },
+      { kind: "exit", code: 0 },
+    ]);
+    expect(pending.stateRecords.map((record) => record.state)).toEqual(["working"]);
+    gate.dispatchOutput(new Uint8Array([3]), (data) => outputs.push([...data]));
+    gate.dispatchState(
+      { agent: "codex", runId: "3", state: "finished", updatedAt: "later" },
+      (record) => states.push(record.state),
+    );
+    expect(outputs).toEqual([[3]]);
+    expect(states).toEqual(["finished"]);
+    expect(exits).toEqual([]);
+  });
+
+  it("builds exact-pane attach commands for local and SSH Terminal.app sessions", () => {
+    const local: Machine = {
+      id: 1,
+      context_id: 1,
+      name: "Local",
+      socket_name: "mission.one",
+      transport: { kind: "local" },
+      last_observed: "unknown",
+      last_observed_at: null,
+    };
+    expect(buildPaneAttachCommand(local, "mission", "%7")).toContain("display-message");
+    expect(buildPaneAttachCommand(local, "mission", "%7")).toContain(
+      "exec 'tmux' '-f' '/dev/null' '-L' 'mission.one' 'attach-session' '-t' '%7'",
+    );
+    const remote: Machine = {
+      ...local,
+      transport: {
+        kind: "ssh",
+        host: "build.example",
+        user: "piero",
+        port: 2222,
+        identityFile: "/tmp/key file",
+        knownHostsFile: "/tmp/known hosts",
+        strictHostKeyChecking: "accept-new",
+      },
+    };
+    const command = buildPaneAttachCommand(remote, "mission", "%7");
+    expect(command).toContain("'ssh' '-tt' '-o' 'BatchMode=yes' '-p' '2222'");
+    expect(command).toContain("'piero@build.example'");
+    expect(command).toContain("'UserKnownHostsFile=/tmp/known hosts'");
+    expect(buildTerminalAppleScript('echo "hello"')).toContain('do script "echo \\\"hello\\\""');
+  });
+
+  it("decodes tmux octal output directly from bytes without losing non-UTF-8 data", () => {
+    expect([
+      ...decodeControlOutput(Buffer.from([65, 92, 48, 48, 48, 92, 51, 55, 55, 255])),
+    ]).toEqual([65, 0, 255, 255]);
+  });
+
+  it("pairs control-mode response blocks FIFO and runs the snapshot barrier at the second end", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "amm-tmux-control-"));
+    try {
+      const fake = path.join(directory, "tmux-fake");
+      await writeFile(
+        fake,
+        `#!/bin/sh\ni=0\nwhile IFS= read -r command; do\n  i=$((i + 1)); printf '%%begin %s 1 0\\n' "$i"\n  case "$command" in\n    *capture-pane*) printf 'screen\\n'; printf '%%output %%7 during-capture\\n'; printf '%%end %s 1 0\\n' "$i"; i=$((i + 1)); printf '%%begin %s 1 0\\n2 1\\n%%end %s 1 0\\n' "$i" "$i" ;;\n    *send-keys*) printf 'denied\\n'; printf '%%error %s 1 0\\n' "$i" ;;\n    *refresh-client*) printf '%s\\n' '%subscription-changed mission-manager-agent-state session 0 window %7 : {"agent":"codex","runId":"3","state":"working","updatedAt":"now","sequence":1}'; printf '%%output %%7 hello\\\\000\\\\377\\n'; printf '%%output %%99 ignored\\n'; printf '%%end %s 1 0\\n' "$i" ;;\n    *) printf '%%end %s 1 0\\n' "$i" ;;\n  esac\ndone\n`,
+      );
+      await chmod(fake, 0o755);
+      const machine: Machine = {
+        id: 1,
+        context_id: 1,
+        name: "Local",
+        socket_name: "test",
+        transport: { kind: "local" },
+        last_observed: "unknown",
+        last_observed_at: null,
+      };
+      const callbacks = { onOutput: vi.fn(), onAgentState: vi.fn(), onExit: vi.fn() };
+      const connection = await TmuxControlConnection.attach(
+        machine,
+        fake,
+        "mission",
+        "%7",
+        callbacks,
+      );
+      expect([...callbacks.onOutput.mock.calls[0]![0]]).toEqual([...Buffer.from("hello"), 0, 255]);
+      expect(callbacks.onOutput).toHaveBeenCalledOnce();
+      expect(callbacks.onAgentState).toHaveBeenCalledWith({
+        agent: "codex",
+        runId: "3",
+        state: "working",
+        updatedAt: "now",
+        sequence: 1,
+      });
+      await expect(connection.sendInput(new Uint8Array([65]))).rejects.toThrow("denied");
+      let afterEnd = false;
+      const snapshot = await connection.capturePaneSnapshot(() => {
+        afterEnd = true;
+      });
+      expect(callbacks.onOutput).toHaveBeenCalledTimes(2);
+      expect(Buffer.from(callbacks.onOutput.mock.calls[1]![0]).toString()).toBe("during-capture");
+      expect(afterEnd).toBe(true);
+      expect(Buffer.from(snapshot).toString()).toBe("screen\u001b[0m\u001b[2;3H");
+      await connection.close();
+      await expect(
+        TmuxControlConnection.attach(
+          machine,
+          path.join(directory, "missing-tmux"),
+          "mission",
+          "%7",
+          callbacks,
+        ),
+      ).rejects.toThrow("Could not attach to Pane on Machine Local: spawn");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
   it("lists panes in one tmux invocation for one session", async () => {
     const runShell = vi.fn(
       async (_machine: Machine, _command: string) => "%7\t0\t314\t120\t40\tMain\tzsh\t/work\n",

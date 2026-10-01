@@ -7,8 +7,22 @@ import { GitCli } from "./git";
 import { normalizeMachinePath, resolveMachinePath, worktreePath } from "./machine-path";
 import { suggestUntrackedRuns } from "../domain/run-suggestions";
 import type { RunSuggestion } from "../domain/execution-types";
-import { TmuxTerminalRuntime, type AgentStateRecord, type TerminalRuntime } from "./terminal";
+import {
+  buildPaneAttachCommand,
+  buildTerminalAppleScript,
+  TerminalCallbackGate,
+  TmuxTerminalRuntime,
+  type AgentStateRecord,
+  type PaneSummary,
+  type TerminalRuntime,
+} from "./terminal";
 import type { RunReconciliationResult, MachineObservationFailure } from "../domain/types";
+import type {
+  TerminalOutputEvent,
+  TerminalExitEvent,
+  TerminalAttachment,
+  PaneTab,
+} from "../domain/terminal-types";
 
 function sameSuggestion(left: RunSuggestion, right: RunSuggestion): boolean {
   return (
@@ -31,6 +45,11 @@ export function createWorkCommandHandlers(
   machineAccess: MachineAccess = new LocalSshMachineAccess(),
   terminalRuntime: TerminalRuntime = new TmuxTerminalRuntime(machineAccess),
   onRunStateChanged: (event: { runId: number; state: string }) => void = () => undefined,
+  onTerminalEvent: (
+    name: "terminal-output" | "terminal-exit",
+    event: TerminalOutputEvent | TerminalExitEvent,
+  ) => void = () => undefined,
+  onRunQuestionsChanged: (runId: number) => void = () => undefined,
 ) {
   const reconcileRuns = async (): Promise<RunReconciliationResult> => {
     if (!runtime.beginReconciliation()) return { failures: [], changed: false };
@@ -148,6 +167,70 @@ export function createWorkCommandHandlers(
       return { failures, changed };
     } finally {
       runtime.endReconciliation();
+    }
+  };
+  const applyTerminalStateRecord = (
+    terminalId: string,
+    generation: number,
+    runId: number,
+    record: AgentStateRecord,
+  ) => {
+    if (!runtime.terminalOpenIsCurrent(terminalId, generation)) return;
+    const run = runtime.snapshot().runs.find((entry) => entry.id === runId);
+    if (!run || run.agent !== record.agent || Number(record.runId) !== runId) return;
+    const previousSequence = run.last_applied_agent_state_sequence ?? null;
+    const oldState = run.state;
+    runtime.dispatch({
+      type: "observe_run",
+      runId,
+      state: record.state,
+      sequence: record.sequence ?? null,
+      paneStatus: run.pane_status,
+    });
+    const updated = runtime.snapshot().runs.find((entry) => entry.id === runId);
+    const reportAccepted =
+      record.sequence === undefined
+        ? previousSequence === null
+        : updated?.last_applied_agent_state_sequence === record.sequence &&
+          previousSequence !== record.sequence;
+    if (updated && updated.state !== oldState) onRunStateChanged({ runId, state: updated.state });
+    if (reportAccepted && (record.state === "blocked" || record.state === "finished")) {
+      void reconcileRuns()
+        .then(() => {
+          if (run.execution_profile === "grill") onRunQuestionsChanged(runId);
+        })
+        .catch((error) =>
+          console.error(
+            `Could not reconcile Run ${runId} after terminal state changed: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        );
+    }
+  };
+  const recoverTerminalRunState = async (
+    terminalId: string,
+    generation: number,
+    run: NonNullable<ReturnType<Runtime["snapshot"]>["runs"][number]>,
+    machine: NonNullable<ReturnType<Runtime["snapshot"]>["machines"][number]>,
+  ) => {
+    try {
+      const observation = await terminalRuntime.observeMachine(machine, [run.id]);
+      const paneRecord = Array.isArray(observation.panes)
+        ? observation.panes.find(
+            (pane) => pane.sessionName === run.session_name && pane.paneId === run.pane_id,
+          )?.agentState
+        : null;
+      const fileRecord = observation.stateRecords.find(
+        (record) => Number(record.runId) === run.id && record.agent === run.agent,
+      );
+      const record =
+        fileRecord && (!paneRecord || (fileRecord.sequence ?? -1) > (paneRecord.sequence ?? -1))
+          ? fileRecord
+          : paneRecord;
+      if (record) applyTerminalStateRecord(terminalId, generation, run.id, record);
+    } catch (error) {
+      console.error(
+        `Could not recover state for Run ${run.id} while opening its terminal: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   };
   const updateItem = (event: Event, itemId: number): Item => {
@@ -546,6 +629,225 @@ export function createWorkCommandHandlers(
     },
     prepare_worktree: prepareWorktree,
     attach_worktree: attachWorktree,
+    open_terminal: async (args: Record<string, unknown>): Promise<TerminalAttachment> => {
+      const runId = Number(args.runId);
+      const terminalId = String(args.terminalId ?? "");
+      const sessionName = String(args.sessionName ?? "");
+      const paneId = String(args.paneId ?? "");
+      if (!terminalId.trim()) throw new Error("A terminal identity is required");
+      if (!terminalRuntime.attachConnection)
+        throw new Error("Terminal connections are not supported by this runtime");
+      const generation = runtime.beginTerminalOpen(terminalId);
+      const state = runtime.snapshot();
+      const run = state.runs.find((entry) => entry.id === runId);
+      if (!run || run.session_name !== sessionName)
+        throw new Error("The Pane does not belong to that Run");
+      const machine = state.machines.find((entry) => entry.id === run.machine_id);
+      if (!machine) throw new Error(`Machine ${run.machine_id} does not exist`);
+      if (typeof (terminalRuntime as Partial<TerminalRuntime>).observeMachine === "function")
+        await recoverTerminalRunState(terminalId, generation, run, machine);
+      const before = await terminalRuntime.listPanes(machine, sessionName);
+      if (!before.some((pane) => pane.paneId === paneId))
+        throw new Error(`Pane ${paneId} is not available in session ${sessionName}`);
+      const callbackGate = new TerminalCallbackGate();
+      const connection = await terminalRuntime.attachConnection(machine, sessionName, paneId, {
+        onOutput: (data) =>
+          callbackGate.dispatchOutput(data, (liveData) => {
+            const event = {
+              terminalId,
+              generation,
+              paneId,
+              data: [...liveData],
+            } satisfies TerminalOutputEvent;
+            onTerminalEvent("terminal-output", event);
+          }),
+        onExit: (code) =>
+          callbackGate.dispatchExit(code, (liveCode) => {
+            const event = {
+              terminalId,
+              generation,
+              paneId,
+              code: liveCode,
+            } satisfies TerminalExitEvent;
+            onTerminalEvent("terminal-exit", event);
+          }),
+        onAgentState: (record) =>
+          callbackGate.dispatchState(record, (acceptedRecord) =>
+            applyTerminalStateRecord(terminalId, generation, runId, acceptedRecord),
+          ),
+      });
+      let snapshot: Uint8Array;
+      try {
+        snapshot = await connection.capturePaneSnapshot(() => {
+          callbackGate.markSnapshotCaptured();
+        });
+      } catch (error) {
+        await connection.close();
+        throw error;
+      }
+      let panes: PaneSummary[];
+      try {
+        panes = await terminalRuntime.listPanes(machine, sessionName);
+      } catch (error) {
+        await connection.close();
+        throw error;
+      }
+      if (!panes.some((pane) => pane.paneId === paneId)) {
+        await connection.close();
+        throw new Error(`Pane ${paneId} is no longer available in session ${sessionName}`);
+      }
+      const latest = runtime.snapshot();
+      if (
+        !runtime.terminalOpenIsCurrent(terminalId, generation) ||
+        !latest.runs.some(
+          (entry) =>
+            entry.id === runId &&
+            entry.machine_id === run.machine_id &&
+            entry.session_name === sessionName &&
+            entry.pane_id === run.pane_id,
+        ) ||
+        !latest.machines.some(
+          (entry) => entry.id === machine.id && JSON.stringify(entry) === JSON.stringify(machine),
+        )
+      ) {
+        await connection.close();
+        throw new Error("A newer terminal open superseded this request");
+      }
+      const openedRun = latest.runs.find((entry) => entry.id === runId)!;
+      if (openedRun.pane_status !== "available") {
+        runtime.dispatch({
+          type: "observe_run",
+          runId,
+          state: openedRun.state,
+          sequence: openedRun.last_applied_agent_state_sequence ?? null,
+          paneStatus: "available",
+        });
+      }
+      const previous = runtime.setTerminalConnection(terminalId, generation, connection);
+      if (!runtime.terminalOpenIsCurrent(terminalId, generation)) {
+        await connection.close();
+        throw new Error("A newer terminal open superseded this request");
+      }
+      const pending = callbackGate.activateAndDrain();
+      for (const event of pending.terminalEvents) {
+        if (event.kind === "output")
+          onTerminalEvent("terminal-output", {
+            terminalId,
+            generation,
+            paneId,
+            data: [...event.data],
+          });
+        else onTerminalEvent("terminal-exit", { terminalId, generation, paneId, code: event.code });
+      }
+      for (const record of pending.stateRecords)
+        applyTerminalStateRecord(terminalId, generation, runId, record);
+      if (previous) await previous.close();
+      if (
+        !runtime.terminalOpenIsCurrent(terminalId, generation) ||
+        runtime.terminalConnection(terminalId)?.generation !== generation
+      ) {
+        await connection.close();
+        throw new Error("A newer terminal open superseded this request");
+      }
+      const tabs: PaneTab[] = panes.map((pane) => ({
+        paneId: pane.paneId,
+        sessionName,
+        runId,
+        label: pane.paneTitle || pane.currentCommand || pane.paneId,
+        available: true,
+        paneIndex: pane.paneIndex,
+        pid: pane.panePid,
+        columns: pane.paneWidth,
+        rows: pane.paneHeight,
+        title: pane.paneTitle,
+        currentCommand: pane.currentCommand,
+        currentPath: pane.currentPath,
+      }));
+      return { terminalId, generation, sessionName, paneId, snapshot: [...snapshot], panes: tabs };
+    },
+    terminal_input: async (args: Record<string, unknown>) => {
+      const terminalId = String(args.terminalId ?? "");
+      const input = args.input;
+      if (
+        !Array.isArray(input) ||
+        input.some((byte) => !Number.isInteger(byte) || byte < 0 || byte > 255)
+      )
+        throw new Error("Terminal input must be an array of bytes");
+      const current = runtime.terminalConnection(terminalId);
+      if (!current) throw new Error("The embedded terminal is not attached");
+      await current.connection.sendInput(Uint8Array.from(input as number[]));
+      return null;
+    },
+    terminal_resize: async (args: Record<string, unknown>) => {
+      const terminalId = String(args.terminalId ?? "");
+      const current = runtime.terminalConnection(terminalId);
+      if (!current) throw new Error("The embedded terminal is not attached");
+      await current.connection.resize(Number(args.columns), Number(args.rows));
+      return null;
+    },
+    close_terminal: async (args: Record<string, unknown>) => {
+      const terminalId = String(args.terminalId ?? "");
+      runtime.beginTerminalOpen(terminalId);
+      const connection = runtime.removeTerminalConnection(terminalId);
+      if (connection) await connection.close();
+      return null;
+    },
+    open_external_terminal: async (args: Record<string, unknown>) => {
+      const runId = Number(args.runId);
+      const state = runtime.snapshot();
+      const run = state.runs.find((entry) => entry.id === runId);
+      if (!run) throw new Error(`Run ${runId} does not exist`);
+      const machine = state.machines.find((entry) => entry.id === run.machine_id);
+      if (!machine) throw new Error(`Machine ${run.machine_id} does not exist`);
+      let panes: PaneSummary[];
+      try {
+        panes = await terminalRuntime.listPanes(machine, run.session_name);
+      } catch (error) {
+        throw new Error(
+          `Pane ${run.pane_id} is not available in session ${run.session_name}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (!panes.some((pane) => pane.paneId === run.pane_id))
+        throw new Error(`Pane ${run.pane_id} is not available in session ${run.session_name}`);
+      const latest = runtime.snapshot();
+      if (
+        !latest.runs.some(
+          (entry) =>
+            entry.id === run.id &&
+            entry.machine_id === run.machine_id &&
+            entry.session_name === run.session_name &&
+            entry.pane_id === run.pane_id,
+        ) ||
+        !latest.machines.some(
+          (entry) => entry.id === machine.id && JSON.stringify(entry) === JSON.stringify(machine),
+        )
+      )
+        throw new Error("The Run or Machine changed while its terminal was opening");
+      const { execFile } = await import("node:child_process");
+      const tmuxExecutable =
+        terminalRuntime instanceof TmuxTerminalRuntime ? terminalRuntime.tmuxExecutable : "tmux";
+      const command = buildPaneAttachCommand(
+        machine,
+        run.session_name,
+        run.pane_id,
+        tmuxExecutable,
+      );
+      const script = buildTerminalAppleScript(command);
+      await new Promise<void>((resolve, reject) =>
+        execFile("osascript", ["-e", script], (error, _stdout, stderr) =>
+          error
+            ? reject(
+                new Error(
+                  stderr.trim()
+                    ? `Could not open macOS Terminal: ${stderr.trim()}`
+                    : `macOS Terminal exited with ${error.code ?? error.message}`,
+                ),
+              )
+            : resolve(),
+        ),
+      );
+      return null;
+    },
   };
 
   async function controlUntrackedAgent(suggestion: RunSuggestion, remove: boolean): Promise<null> {

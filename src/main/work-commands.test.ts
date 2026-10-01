@@ -103,6 +103,7 @@ describe("Run reconciliation", () => {
     const store = openSqliteStore(file);
     const initialState = store.loadState();
     initialState.runs[0]!.execution_profile = "grill";
+    initialState.runs[0]!.pane_status = "unknown";
     initialState.runs[0]!.state = "working";
     initialState.implementation_queues[0]!.entries = [
       {
@@ -194,6 +195,253 @@ describe("Run reconciliation", () => {
     ).queue_json;
     expect(JSON.parse(queueJson).pausedReason).toEqual({ kind: "pane_missing" });
     raw.close();
+    store.close();
+  });
+});
+
+describe("embedded terminal commands", () => {
+  it("allows a sibling Pane and lets a newer open win over a stale connection", async () => {
+    const { copyFileSync } = await import("node:fs");
+    const directory = mkdtempSync(path.join(tmpdir(), "mission-manager-terminal-"));
+    directories.push(directory);
+    const file = path.join(directory, "mission-manager.sqlite");
+    copyFileSync(path.join(__dirname, "persistence/fixtures/rust-persistence.sqlite"), file);
+    const store = openSqliteStore(file);
+    const initialState = store.loadState();
+    initialState.runs[0]!.execution_profile = "grill";
+    const runtime = new Runtime(store, initialState);
+    const { FakeTerminalConnection } = await import("./terminal");
+    const stale = new FakeTerminalConnection();
+    const current = new FakeTerminalConnection();
+    let releaseStale!: () => void;
+    const staleCapture = new Promise<void>((resolve) => {
+      releaseStale = resolve;
+    });
+    stale.gates.set("capturePaneSnapshot", staleCapture);
+    stale.snapshot = new Uint8Array([11]);
+    current.snapshot = new Uint8Array([22]);
+    let stateListener: ((record: import("./terminal").AgentStateRecord) => void) | undefined;
+    let observeCalls = 0;
+    const run = runtime.snapshot().runs[0]!;
+    const pane = {
+      paneId: "%2",
+      paneIndex: 0,
+      panePid: 123,
+      paneWidth: 80,
+      paneHeight: 24,
+      paneTitle: "Claude",
+      currentCommand: "claude",
+      currentPath: "/work",
+    };
+    let attachment = 0;
+    const terminal = {
+      listPanes: async () => [pane],
+      observeMachine: async () => {
+        observeCalls += 1;
+        return {
+          panes: [{ sessionName: run.session_name, paneId: run.pane_id, agentState: null }],
+          stateRecords: [],
+        };
+      },
+      attachConnection: async (
+        _machine: unknown,
+        _session: string,
+        _pane: string,
+        callbacks: import("./terminal").TerminalConnectionCallbacks,
+      ) => {
+        stateListener = callbacks.onAgentState;
+        return attachment++ === 0 ? stale : current;
+      },
+    } as never;
+    const stateEvents: { runId: number; state: string }[] = [];
+    const questionEvents: number[] = [];
+    const dispatch = createCommandDispatcher(
+      createWorkCommandHandlers(
+        runtime,
+        undefined,
+        terminal,
+        (event) => stateEvents.push(event),
+        undefined,
+        (runId) => questionEvents.push(runId),
+      ),
+    );
+    const args = {
+      runId: 1,
+      terminalId: "terminal-a",
+      sessionName: "mission-item-1-run-1",
+      paneId: "%2",
+    };
+    const first = invokeEnvelope(dispatch, "open_terminal", args);
+    while (stale.calls.every((call) => call.operation !== "capturePaneSnapshot"))
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = (await invokeEnvelope(dispatch, "open_terminal", args)) as {
+      generation: number;
+      snapshot: number[];
+    };
+    expect(second).toMatchObject({ generation: 2, snapshot: [22] });
+    expect(runtime.snapshot().runs[0]?.pane_status).toBe("available");
+    expect(store.loadState().runs[0]?.pane_status).toBe("available");
+    stateListener?.({
+      agent: run.agent,
+      runId: String(run.id),
+      state: "blocked",
+      updatedAt: "now",
+      sequence: 1,
+    });
+    expect(runtime.snapshot().runs[0]).toMatchObject({
+      state: "blocked",
+      last_applied_agent_state_sequence: 1,
+    });
+    expect(store.loadState().runs[0]).toMatchObject({
+      state: "blocked",
+      last_applied_agent_state_sequence: 1,
+    });
+    expect(stateEvents).toEqual([{ runId: run.id, state: "blocked" }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(observeCalls).toBeGreaterThanOrEqual(3);
+    expect(questionEvents).toEqual([run.id]);
+    releaseStale();
+    await expect(first).rejects.toBe("A newer terminal open superseded this request");
+    expect(stale.closed).toBe(true);
+    expect(runtime.terminalConnection("terminal-a")?.generation).toBe(2);
+    await invokeEnvelope(dispatch, "close_terminal", { terminalId: "terminal-a" });
+    store.close();
+  });
+
+  it("closes an attached connection when the second live Pane check fails", async () => {
+    const { copyFileSync } = await import("node:fs");
+    const directory = mkdtempSync(path.join(tmpdir(), "mission-manager-terminal-list-"));
+    directories.push(directory);
+    const file = path.join(directory, "mission-manager.sqlite");
+    copyFileSync(path.join(__dirname, "persistence/fixtures/rust-persistence.sqlite"), file);
+    const store = openSqliteStore(file);
+    const runtime = new Runtime(store);
+    const { FakeTerminalConnection } = await import("./terminal");
+    const connection = new FakeTerminalConnection();
+    let listCount = 0;
+    const pane = {
+      paneId: "%1",
+      paneIndex: 0,
+      panePid: 123,
+      paneWidth: 80,
+      paneHeight: 24,
+      paneTitle: "Claude",
+      currentCommand: "claude",
+      currentPath: "/work",
+    };
+    const terminal = {
+      listPanes: async () => {
+        listCount += 1;
+        if (listCount === 2) throw new Error("Pane listing failed");
+        return [pane];
+      },
+      attachConnection: async () => connection,
+    } as never;
+    const dispatch = createCommandDispatcher(
+      createWorkCommandHandlers(runtime, undefined, terminal),
+    );
+    await expect(
+      invokeEnvelope(dispatch, "open_terminal", {
+        runId: 1,
+        terminalId: "",
+        sessionName: "mission-item-1-run-1",
+        paneId: "%1",
+      }),
+    ).rejects.toBe("A terminal identity is required");
+    await expect(
+      invokeEnvelope(dispatch, "open_terminal", {
+        runId: 1,
+        terminalId: " \t ",
+        sessionName: "mission-item-1-run-1",
+        paneId: "%1",
+      }),
+    ).rejects.toBe("A terminal identity is required");
+    await expect(
+      invokeEnvelope(dispatch, "terminal_input", { terminalId: "missing", input: [1] }),
+    ).rejects.toBe("The embedded terminal is not attached");
+    await expect(
+      invokeEnvelope(dispatch, "terminal_resize", {
+        terminalId: "missing",
+        columns: 80,
+        rows: 24,
+      }),
+    ).rejects.toBe("The embedded terminal is not attached");
+    const result = await dispatch("open_terminal", {
+      runId: 1,
+      terminalId: "terminal-b",
+      sessionName: "mission-item-1-run-1",
+      paneId: "%1",
+    });
+    expect(result).toEqual({ ok: false, error: "Pane listing failed" });
+    expect(connection.closed).toBe(true);
+    expect(runtime.terminalConnection("terminal-b")).toBeUndefined();
+    store.close();
+  });
+
+  it("rejects an open superseded while it closes the previous connection", async () => {
+    const { copyFileSync } = await import("node:fs");
+    const directory = mkdtempSync(path.join(tmpdir(), "mission-manager-terminal-close-race-"));
+    directories.push(directory);
+    const file = path.join(directory, "mission-manager.sqlite");
+    copyFileSync(path.join(__dirname, "persistence/fixtures/rust-persistence.sqlite"), file);
+    const store = openSqliteStore(file);
+    const runtime = new Runtime(store);
+    const { FakeTerminalConnection } = await import("./terminal");
+    const connections = [
+      new FakeTerminalConnection(),
+      new FakeTerminalConnection(),
+      new FakeTerminalConnection(),
+      new FakeTerminalConnection(),
+    ];
+    const availableConnections = [...connections];
+    let releaseClose!: () => void;
+    const closeGate = new Promise<void>((resolve) => {
+      releaseClose = resolve;
+    });
+    connections[1]!.gates.set("close", closeGate);
+    for (const [index, connection] of connections.entries())
+      connection.snapshot = new Uint8Array([index]);
+    const pane = {
+      paneId: "%1",
+      paneIndex: 0,
+      panePid: 123,
+      paneWidth: 80,
+      paneHeight: 24,
+      paneTitle: "Claude",
+      currentCommand: "claude",
+      currentPath: "/work",
+    };
+    const run = runtime.snapshot().runs[0]!;
+    const terminal = {
+      listPanes: async () => [pane],
+      observeMachine: async () => ({
+        panes: [{ sessionName: run.session_name, paneId: run.pane_id, agentState: null }],
+        stateRecords: [],
+      }),
+      attachConnection: async () => availableConnections.shift()!,
+    } as never;
+    const dispatch = createCommandDispatcher(
+      createWorkCommandHandlers(runtime, undefined, terminal),
+    );
+    const args = {
+      runId: 1,
+      terminalId: "terminal-close-race",
+      sessionName: run.session_name,
+      paneId: run.pane_id,
+    };
+    await invokeEnvelope(dispatch, "open_terminal", args);
+    await invokeEnvelope(dispatch, "open_terminal", args);
+    const superseded = invokeEnvelope(dispatch, "open_terminal", args);
+    while (!connections[1]!.calls.some((call) => call.operation === "close"))
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    const latest = (await invokeEnvelope(dispatch, "open_terminal", args)) as {
+      generation: number;
+    };
+    expect(latest.generation).toBe(4);
+    releaseClose();
+    await expect(superseded).rejects.toBe("A newer terminal open superseded this request");
+    expect(runtime.terminalConnection(args.terminalId)?.generation).toBe(4);
+    await invokeEnvelope(dispatch, "close_terminal", { terminalId: args.terminalId });
     store.close();
   });
 });

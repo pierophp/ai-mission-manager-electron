@@ -151,10 +151,23 @@ if (!hasSingleInstance) {
           ...createReadCommandHandlers(store),
           ...createSetupCommandHandlers(runtime, store),
           ...createStructureCommandHandlers(runtime, machineAccess, store),
-          ...createWorkCommandHandlers(runtime, machineAccess, terminalRuntime, (event) => {
-            for (const window of BrowserWindow.getAllWindows())
-              window.webContents.send("run-state-changed", event);
-          }),
+          ...createWorkCommandHandlers(
+            runtime,
+            machineAccess,
+            terminalRuntime,
+            (event) => {
+              for (const window of BrowserWindow.getAllWindows())
+                window.webContents.send("run-state-changed", event);
+            },
+            (name, event) => {
+              for (const window of BrowserWindow.getAllWindows())
+                window.webContents.send(name, event);
+            },
+            (runId) => {
+              for (const window of BrowserWindow.getAllWindows())
+                window.webContents.send("run-questions-changed", runId);
+            },
+          ),
           ...createExternalCommandHandlers(runtime),
           ...createDeletionCommandHandlers(runtime, machineAccess),
         }),

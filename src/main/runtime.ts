@@ -3,12 +3,18 @@ import type { Event } from "../domain/events";
 import type { DomainState } from "../domain/model";
 import type { ExternalObject } from "../domain/types";
 import type { SqliteStore } from "./persistence/sqlite-store";
+import type { TerminalConnection } from "./terminal";
 
 export class Runtime {
   private state: DomainState;
   private reconciliationInProgress = false;
   private readonly externalSnapshotRequestGenerations = new Map<number, number>();
   private readonly externalSnapshotAppliedGenerations = new Map<number, number>();
+  private readonly terminalOpenGenerations = new Map<string, number>();
+  private readonly terminalConnections = new Map<
+    string,
+    { generation: number; connection: TerminalConnection }
+  >();
   constructor(
     private readonly store: SqliteStore,
     initialState = store.loadState(),
@@ -25,6 +31,37 @@ export class Runtime {
   }
   endReconciliation(): void {
     this.reconciliationInProgress = false;
+  }
+  beginTerminalOpen(terminalId: string): number {
+    const generation = (this.terminalOpenGenerations.get(terminalId) ?? 0) + 1;
+    this.terminalOpenGenerations.set(terminalId, generation);
+    return generation;
+  }
+  terminalOpenIsCurrent(terminalId: string, generation: number): boolean {
+    return this.terminalOpenGenerations.get(terminalId) === generation;
+  }
+  terminalConnection(terminalId: string) {
+    return this.terminalConnections.get(terminalId);
+  }
+  setTerminalConnection(
+    terminalId: string,
+    generation: number,
+    connection: TerminalConnection,
+  ): TerminalConnection | undefined {
+    if (!this.terminalOpenIsCurrent(terminalId, generation)) return undefined;
+    const previous = this.terminalConnections.get(terminalId)?.connection;
+    this.terminalConnections.set(terminalId, { generation, connection });
+    return previous;
+  }
+  removeTerminalConnection(
+    terminalId: string,
+    generation?: number,
+  ): TerminalConnection | undefined {
+    const current = this.terminalConnections.get(terminalId);
+    if (!current || (generation !== undefined && current.generation !== generation))
+      return undefined;
+    this.terminalConnections.delete(terminalId);
+    return current.connection;
   }
   auditEntryCount(): number {
     return this.store.auditEntryCount();
