@@ -816,6 +816,7 @@ export type AuditAction = {
   archived?: boolean;
   machine_id?: number;
   run_count?: number | null;
+  worktree_count?: number | null;
   observation?: string;
   run_id?: number;
   external_object_id?: number | null;

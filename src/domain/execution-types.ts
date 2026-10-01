@@ -120,6 +120,8 @@ export type Run = {
   grill_action: GrillContinuationAction | null;
   plan_phase: PlanPhase | null;
   plan_path: string | null;
+  implementation_queue_id?: number | null;
+  implementation_queue_position?: number | null;
 };
 
 export type RunSuggestion = {

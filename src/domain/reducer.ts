@@ -12,6 +12,7 @@ import type {
   Machine,
 } from "./types";
 import type { Decision, Effect, Event } from "./events";
+import type { ExecutionProfile, Workflow } from "./execution-types";
 import {
   planExternalObjectDeletion,
   planItemDeletion,
@@ -19,6 +20,26 @@ import {
   planRepositoryDeletion,
   parentSelectionMatches,
 } from "./deletion";
+
+function workspacePreparationState(
+  state: DomainState,
+  workspace: DomainState["workspaces"][number],
+  previous: DomainState["workspaces"][number]["preparation_state"],
+) {
+  const projectId = state.items.find((item) => item.id === workspace.item_id)?.project_id;
+  const repositories = state.repositories.filter(
+    (repository) => repository.project_id === projectId,
+  );
+  const complete =
+    repositories.length > 0 &&
+    repositories.every((repository) =>
+      state.worktrees.some(
+        (worktree) =>
+          worktree.workspaceId === workspace.id && worktree.repositoryId === repository.id,
+      ),
+    );
+  return complete ? "ready" : previous === "resumable" ? "resumable" : "pending";
+}
 
 export function decide(state: DomainState, event: Event): Decision {
   const next = structuredClone(state);
@@ -232,6 +253,235 @@ export function decide(state: DomainState, event: Event): Decision {
     });
   };
   switch (event.type) {
+    case "start_run": {
+      const run = structuredClone(event.run);
+      if (run.id !== next.next_run_id)
+        throw new DomainError(`Run ${run.id} is not the next available Run id`);
+      const item = next.items.find((candidate) => candidate.id === run.item_id);
+      if (!item) throw new DomainError(`Item ${run.item_id} does not exist`);
+      const project = next.projects.find((candidate) => candidate.id === item.project_id);
+      if (!project) throw new DomainError(`Project ${item.project_id} does not exist`);
+      const context = next.contexts.find((candidate) => candidate.id === project.context_id);
+      if (!context) throw new DomainError(`Context ${project.context_id} does not exist`);
+      const workspace = next.workspaces.find(
+        (candidate) => candidate.id === run.workspace_id && candidate.item_id === run.item_id,
+      );
+      if (!workspace)
+        throw new DomainError(
+          `Workspace ${String(run.workspace_id)} does not belong to Item ${run.item_id}`,
+        );
+      const machine = next.machines.find((candidate) => candidate.id === run.machine_id);
+      if (!machine) throw new DomainError(`Machine ${run.machine_id} does not exist`);
+      if (machine.context_id !== context.id || context.execution_machine_id !== machine.id)
+        throw new DomainError(
+          `Machine ${machine.id} is not the execution Machine for Context ${context.name}`,
+        );
+      const repository = next.repositories.find((candidate) => candidate.id === run.repository_id);
+      if (!repository || repository.project_id !== project.id)
+        throw new DomainError(
+          `Repository ${String(run.repository_id)} does not belong to Project ${project.id}`,
+        );
+      if (!run.prompt.trim()) throw new DomainError("Run prompt cannot be empty");
+      if (!run.working_directory.trim())
+        throw new DomainError("Run working directory cannot be empty");
+      if (!run.session_name.trim()) throw new DomainError("Run session name cannot be empty");
+      if (!run.pane_id.trim()) throw new DomainError("Run Pane id cannot be empty");
+      const profiles: Record<Workflow, ExecutionProfile[]> = {
+        "matt-pocock": ["grill", "investigate", "implement", "review", "custom"],
+        pstack: ["autonomous", "plan", "pstack-review", "custom"],
+      };
+      if (!profiles[run.workflow].includes(run.execution_profile))
+        throw new DomainError(
+          `Execution Profile ${run.execution_profile} is not in Workflow ${run.workflow}`,
+        );
+      if (run.execution_profile === "grill" && run.workflow !== "matt-pocock")
+        throw new DomainError("Grill Runs must use the matt-pocock Workflow");
+      if (run.worktree_id !== null) {
+        const worktree = next.worktrees.find((candidate) => candidate.id === run.worktree_id);
+        if (
+          !worktree ||
+          worktree.workspaceId !== workspace.id ||
+          worktree.machineId !== machine.id ||
+          worktree.repositoryId !== repository.id
+        )
+          throw new DomainError(`Worktree ${run.worktree_id} is not registered for this Run`);
+        if (run.working_directory !== worktree.path || run.direct_checkouts.length)
+          throw new DomainError(`Run ${run.id} does not match Worktree ${worktree.id}`);
+      } else {
+        const projectRepositoryIds = next.repositories
+          .filter((candidate) => candidate.project_id === project.id)
+          .map((candidate) => candidate.id);
+        const checkoutIds = run.direct_checkouts.map((checkout) => checkout.repositoryId);
+        if (
+          !checkoutIds.length ||
+          new Set(checkoutIds).size !== checkoutIds.length ||
+          projectRepositoryIds.some((id) => !checkoutIds.includes(id)) ||
+          checkoutIds.some((id) => !projectRepositoryIds.includes(id)) ||
+          run.direct_checkouts.some((checkout) => !checkout.path.trim() || !checkout.branch.trim())
+        )
+          throw new DomainError("Run Direct checkouts do not match the Project Repositories");
+        const primary = run.direct_checkouts.find(
+          (checkout) => checkout.repositoryId === repository.id,
+        );
+        if (!primary || primary.path !== run.working_directory)
+          throw new DomainError("Run working directory does not match its primary Repository");
+      }
+      if (
+        run.cli_configuration_profile &&
+        (!next.cli_configuration_profiles.some(
+          (profile) =>
+            profile.id === run.cli_configuration_profile!.profileId &&
+            profile.machineId === machine.id &&
+            profile.provider === run.agent &&
+            profile.name === run.cli_configuration_profile!.name,
+        ) ||
+          run.cli_configuration_profile.provider !== run.agent)
+      )
+        throw new DomainError("Run CLI configuration profile does not match its Machine and agent");
+      let attachedQueue: DomainState["implementation_queues"][number] | undefined;
+      if (event.queueAttachment) {
+        const { queueId, position } = event.queueAttachment;
+        attachedQueue = next.implementation_queues.find((queue) => queue.id === queueId);
+        if (!attachedQueue) throw new DomainError(`Implementation Queue ${queueId} does not exist`);
+        if (
+          attachedQueue.itemId !== run.item_id ||
+          attachedQueue.workspaceId !== run.workspace_id ||
+          attachedQueue.repositoryId !== run.repository_id
+        )
+          throw new DomainError(`Implementation Queue ${queueId} does not match Run ${run.id}`);
+        const entry = attachedQueue.entries.find((candidate) => candidate.position === position);
+        if (!entry)
+          throw new DomainError(`Implementation Queue ${queueId} entry ${position} does not exist`);
+        if (entry.done)
+          throw new DomainError(
+            `Implementation Queue ${queueId} entry ${position} is already done`,
+          );
+        entry.runId = run.id;
+        attachedQueue.pausedReason = null;
+        run.implementation_queue_id = queueId;
+        run.implementation_queue_position = position;
+      }
+      if (
+        next.runs.some(
+          (candidate) =>
+            candidate.machine_id === run.machine_id && candidate.session_name === run.session_name,
+        )
+      )
+        throw new DomainError(
+          `Run session ${run.session_name} already exists on Machine ${run.machine_id}`,
+        );
+      next.next_run_id++;
+      next.runs.push(run);
+      effects.push({ type: "persist_run", run, nextRunId: next.next_run_id });
+      if (attachedQueue)
+        effects.push({
+          type: "persist_implementation_queue",
+          queue: structuredClone(attachedQueue),
+        });
+      effects.push({ type: "persist_audit", action: { action: "runCreated", run_id: run.id } });
+      break;
+    }
+    case "stop_run": {
+      const run = next.runs.find((candidate) => candidate.id === event.runId);
+      if (!run) throw new DomainError(`Run ${event.runId} does not exist`);
+      run.pane_status = "missing";
+      if (run.execution_profile === "grill" && runIsActive(run))
+        run.grill_phase = "recoverablePaneLoss";
+      effects.push({ type: "persist_run_observation", run: structuredClone(run) });
+      effects.push({ type: "persist_audit", action: { action: "runStopped", run_id: run.id } });
+      break;
+    }
+    case "finish_run": {
+      const run = next.runs.find((candidate) => candidate.id === event.runId);
+      if (!run) throw new DomainError(`Run ${event.runId} does not exist`);
+      run.state = "finished";
+      if (run.execution_profile === "grill") run.grill_phase = "finished";
+      else if (run.execution_profile === "plan" && run.plan_phase !== "executing")
+        run.plan_phase = "awaitingGo";
+      effects.push({ type: "persist_run_observation", run: structuredClone(run) });
+      effects.push({ type: "persist_audit", action: { action: "runFinished", run_id: run.id } });
+      break;
+    }
+    case "delete_run": {
+      const run = next.runs.find((candidate) => candidate.id === event.runId);
+      if (!run) throw new DomainError(`Run ${event.runId} does not exist`);
+      if (
+        run.state !== "finished" ||
+        (run.execution_profile === "grill" && run.grill_phase !== "finished") ||
+        (run.execution_profile === "plan" && run.plan_phase === "awaitingGo")
+      )
+        throw new DomainError(`Run ${event.runId} is active and cannot be deleted`);
+      next.runs = next.runs.filter((candidate) => candidate.id !== event.runId);
+      effects.push({ type: "remove_run", runId: event.runId });
+      effects.push({ type: "persist_audit", action: { action: "runDeleted", run_id: run.id } });
+      break;
+    }
+    case "delete_machine": {
+      const machine = next.machines.find((candidate) => candidate.id === event.machineId);
+      if (!machine) throw new DomainError(`Machine ${event.machineId} does not exist`);
+      const actualRuns = next.runs
+        .filter((run) => run.machine_id === event.machineId)
+        .map((run) => run.id);
+      const actualWorktrees = next.worktrees
+        .filter((tree) => tree.machineId === event.machineId)
+        .map((tree) => tree.id);
+      const actualLocations = next.repository_locations
+        .filter((location) => location.machine_id === event.machineId)
+        .map((location) => location.repository_id);
+      const sameIds = (left: number[], right: number[]) =>
+        [...left].sort((a, b) => a - b).join(",") === [...right].sort((a, b) => a - b).join(",");
+      if (!sameIds(actualRuns, event.runIds))
+        throw new DomainError(`Machine ${event.machineId} Run selection changed`);
+      if (!sameIds(actualWorktrees, event.worktreeIds))
+        throw new DomainError(`Machine ${event.machineId} Worktree selection changed`);
+      if (!sameIds(actualLocations, event.repositoryLocationRepositoryIds))
+        throw new DomainError(`Machine ${event.machineId} Repository location selection changed`);
+      for (const context of next.contexts) {
+        if (context.execution_machine_id === event.machineId) {
+          context.execution_machine_id = null;
+          context.claude_profile_id = null;
+          context.codex_profile_id = null;
+          effects.push({ type: "update_context", context });
+        }
+      }
+      next.cli_configuration_profiles = next.cli_configuration_profiles.filter(
+        (profile) => profile.machineId !== event.machineId,
+      );
+      const removedRuns = next.runs.filter((run) => run.machine_id === event.machineId);
+      next.runs = next.runs.filter((run) => run.machine_id !== event.machineId);
+      effects.push(...removedRuns.map((run) => ({ type: "remove_run" as const, runId: run.id })));
+      const removedTrees = next.worktrees.filter((tree) => tree.machineId === event.machineId);
+      next.worktrees = next.worktrees.filter((tree) => tree.machineId !== event.machineId);
+      effects.push(
+        ...removedTrees.map((tree) => ({ type: "remove_worktree" as const, worktreeId: tree.id })),
+      );
+      for (const workspaceId of new Set(removedTrees.map((tree) => tree.workspaceId))) {
+        const workspace = next.workspaces.find((candidate) => candidate.id === workspaceId);
+        if (workspace) {
+          workspace.preparation_state = workspacePreparationState(
+            next,
+            workspace,
+            workspace.preparation_state,
+          );
+          effects.push({ type: "persist_workspace_update", workspace });
+        }
+      }
+      next.repository_locations = next.repository_locations.filter(
+        (location) => location.machine_id !== event.machineId,
+      );
+      next.machines = next.machines.filter((candidate) => candidate.id !== event.machineId);
+      effects.push({ type: "remove_machine", machineId: event.machineId });
+      effects.push({
+        type: "persist_audit",
+        action: {
+          action: "machineDeleted",
+          machine_id: event.machineId,
+          run_count: removedRuns.length,
+          worktree_count: removedTrees.length,
+        },
+      });
+      break;
+    }
     case "create_context":
       withDefaultProject(event.name);
       break;

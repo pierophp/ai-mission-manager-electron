@@ -248,6 +248,12 @@ export function loadDomainState(database: DatabaseSync): DomainState {
     grill_action_started_at: optionalNumber(row.grill_action_started_at),
     plan_phase: row.plan_phase ? rustPlanPhase(asString(row.plan_phase, "Plan phase")) : null,
     plan_path: optionalString(row.plan_path),
+    ...(row.implementation_queue_id == null
+      ? {}
+      : { implementation_queue_id: optionalNumber(row.implementation_queue_id) }),
+    ...(row.implementation_queue_position == null
+      ? {}
+      : { implementation_queue_position: optionalNumber(row.implementation_queue_position) }),
   }));
   const relationships: ItemRelation[] = rows<Row>(
     database,

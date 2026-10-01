@@ -14,6 +14,8 @@ import { openSqliteStore, type SqliteStore } from "./main/persistence/sqlite-sto
 import { ensureProjectWorkspaces, recoverRunStateRecords } from "./main/persistence/startup";
 import { LocalSshMachineAccess } from "./main/machine-access";
 import { TmuxTerminalRuntime } from "./main/terminal";
+import { createRunLaunchHandlers } from "./main/run-launcher";
+import { createMachineDeletionHandlers } from "./main/machine-deletion";
 
 const execFileAsync = promisify(execFile);
 const hasSingleInstance = app.requestSingleInstanceLock();
@@ -168,6 +170,8 @@ if (!hasSingleInstance) {
                 window.webContents.send("run-questions-changed", runId);
             },
           ),
+          ...createRunLaunchHandlers(runtime, machineAccess, terminalRuntime),
+          ...createMachineDeletionHandlers(runtime, terminalRuntime),
           ...createExternalCommandHandlers(runtime),
           ...createDeletionCommandHandlers(runtime, machineAccess),
         }),

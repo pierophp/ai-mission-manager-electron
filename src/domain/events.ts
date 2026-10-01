@@ -25,6 +25,21 @@ import type {
 import type { DomainState } from "./model";
 
 export type Event =
+  | {
+      type: "start_run";
+      run: import("./execution-types").Run;
+      queueAttachment?: { queueId: number; position: number };
+    }
+  | { type: "stop_run"; runId: number }
+  | { type: "finish_run"; runId: number }
+  | { type: "delete_run"; runId: number }
+  | {
+      type: "delete_machine";
+      machineId: number;
+      runIds: number[];
+      worktreeIds: number[];
+      repositoryLocationRepositoryIds: number[];
+    }
   | { type: "create_context"; name: string }
   | { type: "complete_setup"; contextName: string; provider: ProviderChoice }
   | { type: "create_context_configuration"; configuration: ContextConfiguration }
@@ -228,7 +243,10 @@ export type Effect =
   | { type: "update_machine"; machine: Machine }
   | { type: "persist_machine_observation"; machine: Machine }
   | { type: "persist_run_observation"; run: import("./execution-types").Run }
+  | { type: "persist_audit"; action: import("./types").AuditAction }
   | { type: "persist_run"; run: import("./execution-types").Run; nextRunId: number }
+  | { type: "remove_run"; runId: number }
+  | { type: "remove_machine"; machineId: number }
   | { type: "persist_implementation_queue"; queue: import("./types").ImplementationQueue }
   | {
       type: "persist_cli_configuration_profile";

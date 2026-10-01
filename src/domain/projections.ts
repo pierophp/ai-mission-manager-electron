@@ -1,4 +1,3 @@
-import type { DomainState } from "./model";
 import type {
   AttentionEntry,
   ExternalLinkView,
@@ -7,7 +6,142 @@ import type {
   ItemView,
   WorkspaceRepository,
 } from "./types";
-import type { GrillContinuationAction, Run, RunProjection } from "./execution-types";
+import type {
+  ExecutionProfile,
+  GrillContinuationAction,
+  Run,
+  RunProjection,
+  Workflow,
+  RunPromptSelection,
+} from "./execution-types";
+import type { DomainState } from "./model";
+import type { RunLaunchOptions, RunLaunchTargetKind } from "./types";
+
+export function runLaunchOptions(
+  state: DomainState,
+  itemId: number,
+  target: RunLaunchTargetKind,
+): RunLaunchOptions {
+  const item = state.items.find((candidate) => candidate.id === itemId);
+  if (!item) throw new Error(`Item ${itemId} does not exist`);
+  const project = state.projects.find((candidate) => candidate.id === item.project_id);
+  if (!project) throw new Error(`Project ${item.project_id} does not exist`);
+  const context = state.contexts.find((candidate) => candidate.id === project.context_id);
+  if (!context) throw new Error(`Context ${project.context_id} does not exist`);
+  const offers: Record<Workflow, ExecutionProfile[]> = {
+    "matt-pocock": ["grill", "investigate", "implement", "review", "custom"],
+    pstack: ["autonomous", "plan", "pstack-review", "custom"],
+  };
+  const workflows = (Object.keys(offers) as Workflow[]).map((workflow) => ({
+    workflow,
+    defaultProfile:
+      workflow === "pstack"
+        ? ("autonomous" as const)
+        : target === "worktree"
+          ? ("investigate" as const)
+          : ("grill" as const),
+    profiles: offers[workflow]
+      .filter((profile) => !(target === "worktree" && profile === "grill"))
+      .map((executionProfile) => ({
+        executionProfile,
+        configuration:
+          workflow === "pstack"
+            ? (context.pstack_defaults ?? context.implement_defaults ?? context.grill_defaults)
+            : executionProfile === "grill"
+              ? context.grill_defaults
+              : (context.implement_defaults ?? context.grill_defaults),
+        requiresInitialPrompt: ["grill", "custom", "pstack-review"].includes(executionProfile),
+      })),
+  }));
+  return { defaultWorkflow: context.default_workflow ?? "matt-pocock", workflows };
+}
+
+export function composeRunPrompt(
+  state: DomainState,
+  itemId: number,
+  profile: ExecutionProfile,
+  selection: RunPromptSelection,
+  language: "portuguese" | "english" | null,
+  initialPrompt: string | null,
+  implementationSkillSnapshot = "",
+): string {
+  const item = state.items.find((candidate) => candidate.id === itemId);
+  if (!item) throw new Error(`Item ${itemId} does not exist`);
+  const initial = initialPrompt?.trim() || null;
+  const sections: string[] = [];
+  if (selection.includeObjective) sections.push(`Item objective:\n${item.title}`);
+  for (const externalObjectId of selection.externalObjectIds) {
+    if (
+      !state.links.some(
+        (link) => link.item_id === itemId && link.external_object_id === externalObjectId,
+      )
+    )
+      throw new Error(`External Object ${externalObjectId} is not linked to Item ${itemId}`);
+    const object = state.external_objects.find((candidate) => candidate.id === externalObjectId);
+    if (!object) throw new Error(`External Object ${externalObjectId} does not exist`);
+    const title =
+      state.snapshots.find((snapshot) => snapshot.external_object_id === externalObjectId)?.title ??
+      "Linked external object";
+    sections.push(`Linked source:\n${title}\n${object.canonical_url}`);
+  }
+  const instruction: Partial<Record<ExecutionProfile, string>> = {
+    investigate:
+      "Investigate this work, inspect the relevant code, and report findings before changing files.",
+    implement: implementationSkillSnapshot
+      ? `${implementationSkillSnapshot}\n\nImplement this work using the Repositories configured for its Project or a registered Worktree, run the relevant checks, and leave the changes ready for review.`
+      : `Implement this work using the Repositories configured for its Project or a registered Worktree, run the relevant checks, and leave the changes ready for review.`,
+    review:
+      "Review the current changes for this Item for correctness, regressions, and missing test coverage.",
+    custom: initial ?? "",
+    grill:
+      "Use the selected grilling skill to ask a structured frontier of questions before recommending the next decision.",
+  };
+  if (["autonomous", "plan", "pstack-review"].includes(profile))
+    throw new Error(`Execution Profile ${profile} is not in Workflow matt-pocock`);
+  if (profile === "custom" && !initial) throw new Error("Run prompt cannot be empty");
+  sections.unshift(instruction[profile] ?? "");
+  if (profile !== "custom" && initial) sections.push(`User's initial prompt:\n${initial}`);
+  if (language)
+    sections.unshift(
+      `Respond to the user in ${language === "portuguese" ? "Portuguese" : "English"} throughout this Run. Keep code, identifiers, proper names, and quoted source text in their original language when appropriate.`,
+    );
+  return sections.join("\n\n").trim();
+}
+
+export function composeGrillPrompt(
+  state: DomainState,
+  itemId: number,
+  configuration: { agent: "claude" | "codex"; model: string; effort: string },
+  language: "portuguese" | "english",
+  initialPrompt: string,
+  grillSkill: string,
+): string {
+  if (!configuration.model.trim() || !configuration.effort.trim())
+    throw new Error("Invalid Grill configuration");
+  const item = state.items.find((candidate) => candidate.id === itemId);
+  if (!item) throw new Error(`Item ${itemId} does not exist`);
+  const initial = initialPrompt.trim();
+  if (!initial) throw new Error("Run prompt cannot be empty");
+  const context = [`Item objective:\n${item.title}`];
+  for (const link of state.links.filter((candidate) => candidate.item_id === itemId)) {
+    const object = state.external_objects.find(
+      (candidate) => candidate.id === link.external_object_id,
+    );
+    if (object) {
+      const title =
+        state.snapshots.find((snapshot) => snapshot.external_object_id === object.id)?.title ??
+        "Linked external object";
+      context.push(`Linked source:\n${title}\n${object.canonical_url}`);
+    }
+  }
+  const response =
+    language === "portuguese"
+      ? "GRILL_RESPONSE_LANGUAGE=portuguese\nRespond to the user in Portuguese throughout this Grill Run, including every answer and continuation. Keep code, identifiers, proper names, and quoted source text in their original language when appropriate."
+      : "GRILL_RESPONSE_LANGUAGE=english\nRespond to the user in English throughout this Grill Run, including every answer and continuation. Keep code, identifiers, proper names, and quoted source text in their original language when appropriate.";
+  const contract =
+    "Mission Manager output contract (it reads your questions from the terminal and shows them to the user as a form):\n- Start every question on its own line with `❓ **Q<n>** - **<title>**: <question>`. Number questions 1, 2, 3… within the round.\n- Put the recommendation on the line that starts with `➡️`. Do not add prose after the recommendation other than lettered options (`A) …`).\n- Separate questions with a line containing only `---`.\n- Print each round exactly once, at the end of your turn. If a sub-agent you are waiting on changes a question, print only the revised full round; Mission Manager shows only the last round printed in a turn.\n- Keep status notes (what you are checking, what you found) before the first `❓`, never between or after the questions.\n- The user answers every question of the round at once, with one numbered reply (`1. …`, `2. …`). An answer of `ok` accepts your recommendation.";
+  return `You are starting a Grill Run.\n\n${response}\n\nGrill configuration: agent=${JSON.stringify(configuration.agent)}, model=${configuration.model}, effort=${configuration.effort}.\n\nGrilling skill snapshot:\n${grillSkill}\n\n${contract}\n\nRelevant Item context:\n${context.join("\n\n")}\n\nUser's initial prompt:\n${initial}`;
+}
 
 function runIsActive(run: Run): boolean {
   return (

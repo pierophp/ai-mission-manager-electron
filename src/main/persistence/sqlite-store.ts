@@ -80,7 +80,8 @@ export class SqliteStore {
         effect.type === "persist_context" ||
         effect.type === "persist_project" ||
         effect.type === "persist_repository" ||
-        effect.type === "persist_item_relation",
+        effect.type === "persist_item_relation" ||
+        effect.type === "persist_audit",
     );
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -98,6 +99,7 @@ export class SqliteStore {
           action = encodeRepositoryRegisteredAudit(effect.repository.id);
         else if (effect.type === "persist_item_relation")
           action = encodeItemRelationChangedAudit(effect.relation);
+        else if (effect.type === "persist_audit") action = JSON.stringify(effect.action);
         else continue;
         this.database
           .prepare(
@@ -338,14 +340,20 @@ export class SqliteStore {
           encodeGrillPhase(run.grill_phase),
           run.grill_action,
           null,
-          null,
-          null,
+          run.implementation_queue_id ?? null,
+          run.implementation_queue_position ?? null,
           encodePlanPhase(run.plan_phase),
           run.plan_path,
         );
         db.prepare("UPDATE metadata SET value=? WHERE key='next_run_id'").run(effect.nextRunId);
         break;
       }
+      case "remove_run":
+        db.prepare("DELETE FROM runs WHERE id=?").run(effect.runId);
+        break;
+      case "remove_machine":
+        db.prepare("DELETE FROM machines WHERE id=?").run(effect.machineId);
+        break;
       case "persist_implementation_queue":
         db.prepare(
           "INSERT INTO implementation_queues(id,item_id,queue_json) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET queue_json=excluded.queue_json",

@@ -22,6 +22,24 @@ afterEach(() => {
 });
 
 describe("Rust-compatible SQLite store", () => {
+  it("persists explicit Run lifecycle audit actions in the same SQLite transaction", () => {
+    const store = openSqliteStore(temporaryDatabase());
+    const state = store.loadState();
+    store.commit({
+      state,
+      effects: [
+        { type: "persist_audit", action: { action: "runFinished", run_id: 42 } },
+        { type: "persist_audit", action: { action: "runDeleted", run_id: 42 } },
+      ],
+    });
+    const raw = new DatabaseSync(store.path, { readOnly: true });
+    expect(raw.prepare("SELECT action_json FROM audit_entries ORDER BY id").all()).toEqual([
+      { action_json: '{"action":"runFinished","run_id":42}' },
+      { action_json: '{"action":"runDeleted","run_id":42}' },
+    ]);
+    raw.close();
+  });
+
   it("round trips Rust-shaped SSH transport JSON and dispatches Machine/Profile commands", async () => {
     const store = openSqliteStore(temporaryDatabase());
     const runtime = new Runtime(store);
