@@ -10,6 +10,8 @@ import {
   PSTACK_TREE_HASH,
   pstackSkillSnapshot,
   pstackTreeDirectory,
+  resolvePstackResourcePaths,
+  verifyPstackResources,
 } from "./pstack";
 
 const localMachine = {
@@ -43,6 +45,39 @@ describe("vendored pstack resources", () => {
       "e703a1d0f440c3a796e40973f2c284220b1aa45604ddd75fb9bb199540dde018",
     );
     expect(pstackSkillSnapshot()).toContain("pstack version 0.15.5");
+  });
+
+  it("resolves development and packaged resource paths and verifies the manifest", () => {
+    const development = resolvePstackResourcePaths({
+      isPackaged: false,
+      appPath: process.cwd(),
+      resourcesPath: "/unused/resources",
+    });
+    expect(development.treeDirectory).toBe(path.join(process.cwd(), "agents/pstack"));
+    expect(development.manifestFile).toBe(path.join(process.cwd(), "src/main/pstack-manifest.json"));
+    expect(() => verifyPstackResources(development)).not.toThrow();
+
+    const resources = fs.mkdtempSync(path.join(os.tmpdir(), "pstack-packaged-resources-"));
+    try {
+      fs.cpSync(development.treeDirectory, path.join(resources, "pstack"), { recursive: true });
+      fs.copyFileSync(development.manifestFile, path.join(resources, "pstack-manifest.json"));
+      const packaged = resolvePstackResourcePaths({
+        isPackaged: true,
+        appPath: "/unused/app.asar",
+        resourcesPath: resources,
+      });
+      expect(packaged).toEqual({
+        treeDirectory: path.join(resources, "pstack"),
+        manifestFile: path.join(resources, "pstack-manifest.json"),
+      });
+      expect(() => verifyPstackResources(packaged)).not.toThrow();
+      fs.appendFileSync(path.join(packaged.treeDirectory, "README.md"), " modified");
+      expect(() => verifyPstackResources(packaged)).toThrow(
+        "pstack packaged resources do not match the embedded pstack manifest",
+      );
+    } finally {
+      fs.rmSync(resources, { recursive: true, force: true });
+    }
   });
 
   it("provisions into a temporary tree and reuses the content-addressed directory", async () => {

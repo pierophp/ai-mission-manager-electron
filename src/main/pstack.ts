@@ -9,6 +9,82 @@ export const PSTACK_VERSION = pstackManifest.version;
 export const PSTACK_UPSTREAM_COMMIT = pstackManifest.upstreamCommit;
 export const PSTACK_TREE_HASH = pstackManifest.treeHash;
 export const PSTACK_TREE = pstackManifest.files;
+type PstackHashFile = { path: string; contents: Uint8Array; executable: boolean };
+
+function hashPstackFiles(files: readonly PstackHashFile[]) {
+  const hash = createHash("sha256");
+  for (const file of [...files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
+    const contents = Buffer.from(file.contents);
+    const size = Buffer.alloc(8);
+    size.writeBigUInt64BE(BigInt(contents.length));
+    hash.update(Buffer.from(file.path));
+    hash.update(Buffer.from([0]));
+    hash.update(size);
+    hash.update(contents);
+    hash.update(Buffer.from([file.executable ? 1 : 0]));
+  }
+  return hash.digest("hex");
+}
+
+export function resolvePstackResourcePaths(options: {
+  isPackaged: boolean;
+  appPath: string;
+  resourcesPath: string;
+}) {
+  const root = options.isPackaged ? options.resourcesPath : options.appPath;
+  return options.isPackaged
+    ? {
+        treeDirectory: path.join(root, "pstack"),
+        manifestFile: path.join(root, "pstack-manifest.json"),
+      }
+    : {
+        treeDirectory: path.join(root, "agents/pstack"),
+        manifestFile: path.join(root, "src/main/pstack-manifest.json"),
+      };
+}
+
+export function verifyPstackResources(paths: { treeDirectory: string; manifestFile: string }) {
+  const manifest = JSON.parse(fs.readFileSync(paths.manifestFile, "utf8")) as {
+    version?: string;
+    upstreamCommit?: string;
+    treeHash?: string;
+  };
+  if (!fs.statSync(paths.treeDirectory).isDirectory()) {
+    throw new Error("pstack packaged resources do not match the embedded pstack manifest");
+  }
+  if (
+    manifest.version !== PSTACK_VERSION ||
+    manifest.upstreamCommit !== PSTACK_UPSTREAM_COMMIT ||
+    manifest.treeHash !== PSTACK_TREE_HASH ||
+    hashPstackDirectory(paths.treeDirectory) !== PSTACK_TREE_HASH
+  ) {
+    throw new Error("pstack packaged resources do not match the embedded pstack manifest");
+  }
+}
+
+function hashPstackDirectory(directory: string) {
+  const files: { path: string; contents: Buffer; executable: boolean }[] = [];
+  const visit = (current: string) => {
+    for (const entry of fs
+      .readdirSync(current, { withFileTypes: true })
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+      const absolute = path.join(current, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) visit(absolute);
+      else if (entry.isFile()) {
+        const stat = fs.statSync(absolute);
+        files.push({
+          path: path.relative(directory, absolute).split(path.sep).join("/"),
+          contents: fs.readFileSync(absolute),
+          executable: process.platform !== "win32" && (stat.mode & 0o111) !== 0,
+        });
+      }
+    }
+  };
+  visit(directory);
+  return hashPstackFiles(files);
+}
+
 export function pstackTreeDirectory(home: string) {
   return path.join(home, ".local/share/ai-mission-manager/pstack", PSTACK_TREE_HASH);
 }
@@ -83,16 +159,11 @@ export async function provisionPstackTree(machine: Machine, access: MachineAcces
 export function buildPstackTreeHash(
   files: readonly { path: string; base64: string; executable: boolean }[],
 ) {
-  const hash = createHash("sha256");
-  for (const file of [...files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
-    const contents = Buffer.from(file.base64, "base64");
-    const size = Buffer.alloc(8);
-    size.writeBigUInt64BE(BigInt(contents.length));
-    hash.update(Buffer.from(file.path));
-    hash.update(Buffer.from([0]));
-    hash.update(size);
-    hash.update(contents);
-    hash.update(Buffer.from([file.executable ? 1 : 0]));
-  }
-  return hash.digest("hex");
+  return hashPstackFiles(
+    files.map((file) => ({
+      path: file.path,
+      contents: Buffer.from(file.base64, "base64"),
+      executable: file.executable,
+    })),
+  );
 }

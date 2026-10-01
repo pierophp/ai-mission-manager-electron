@@ -1,6 +1,8 @@
 module.exports = {
   packagerConfig: {
     asar: true,
+    extraResource: ["agents/pstack", "src/main/pstack-manifest.json"],
+    ignore: [/ai-mission-manager-tauri/],
   },
   makers: [
     {

@@ -3,20 +3,13 @@ import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 import { createCommandDispatcher, INVOKE_CHANNEL } from "./shared/ipc";
-import { createReadCommandHandlers } from "./main/persistence/commands";
-import { createStructureCommandHandlers } from "./main/structure-commands";
-import { createSetupCommandHandlers } from "./main/setup";
-import { createWorkCommandHandlers } from "./main/work-commands";
-import { createExternalCommandHandlers } from "./main/external-commands";
-import { createDeletionCommandHandlers } from "./main/deletion-commands";
 import { Runtime } from "./main/runtime";
 import { openSqliteStore, type SqliteStore } from "./main/persistence/sqlite-store";
 import { ensureProjectWorkspaces, recoverRunStateRecords } from "./main/persistence/startup";
 import { LocalSshMachineAccess } from "./main/machine-access";
 import { TmuxTerminalRuntime } from "./main/terminal";
-import { createRunLaunchHandlers } from "./main/run-launcher";
-import { createMachineDeletionHandlers } from "./main/machine-deletion";
-import { createPlanUsageCommandHandlers } from "./main/plan-usage";
+import { createMainCommandHandlers } from "./main/command-registry";
+import { resolvePstackResourcePaths, verifyPstackResources } from "./main/pstack";
 
 const execFileAsync = promisify(execFile);
 const hasSingleInstance = app.requestSingleInstanceLock();
@@ -139,6 +132,13 @@ if (!hasSingleInstance) {
   app.whenReady().then(async () => {
     await importLoginShellPath();
     try {
+      verifyPstackResources(
+        resolvePstackResourcePaths({
+          isPackaged: app.isPackaged,
+          appPath: app.getAppPath(),
+          resourcesPath: process.resourcesPath,
+        }),
+      );
       store = openSqliteStore();
       const state = store.loadState();
       const runtime = new Runtime(store, state);
@@ -147,42 +147,26 @@ if (!hasSingleInstance) {
         machineAccess,
         store.setting("tmux_executable_path") ?? "tmux",
       );
-      const runLaunchHandlers = createRunLaunchHandlers(runtime, machineAccess, terminalRuntime);
       ensureProjectWorkspaces(runtime);
       recoverRunStateRecords(runtime, store.path);
-      registerIpc(
-        createCommandDispatcher({
-          ...createReadCommandHandlers(store),
-          ...createPlanUsageCommandHandlers(runtime, store, machineAccess),
-          ...createSetupCommandHandlers(runtime, store),
-          ...createStructureCommandHandlers(runtime, machineAccess, store),
-          ...createWorkCommandHandlers(
-            runtime,
-            machineAccess,
-            terminalRuntime,
-            (event) => {
-              for (const window of BrowserWindow.getAllWindows())
-                window.webContents.send("run-state-changed", event);
-            },
-            (name, event) => {
-              for (const window of BrowserWindow.getAllWindows())
-                window.webContents.send(name, event);
-            },
-            (runId) => {
-              for (const window of BrowserWindow.getAllWindows())
-                window.webContents.send("run-questions-changed", runId);
-            },
-            (request) =>
-              runLaunchHandlers.start_run({ request }) as Promise<
-                import("./domain/execution-types").Run
-              >,
-          ),
-          ...runLaunchHandlers,
-          ...createMachineDeletionHandlers(runtime, terminalRuntime),
-          ...createExternalCommandHandlers(runtime),
-          ...createDeletionCommandHandlers(runtime, machineAccess),
-        }),
-      );
+      const commandHandlers = createMainCommandHandlers({
+        runtime,
+        store,
+        machineAccess,
+        terminalRuntime,
+        onRunStateChanged: (event) => {
+          for (const window of BrowserWindow.getAllWindows())
+            window.webContents.send("run-state-changed", event);
+        },
+        onTerminalEvent: (name, event) => {
+          for (const window of BrowserWindow.getAllWindows()) window.webContents.send(name, event);
+        },
+        onRunQuestionsChanged: (runId) => {
+          for (const window of BrowserWindow.getAllWindows())
+            window.webContents.send("run-questions-changed", runId);
+        },
+      });
+      registerIpc(createCommandDispatcher(commandHandlers));
       mainWindow = createWindow();
     } catch (error) {
       dialog.showErrorBox(
